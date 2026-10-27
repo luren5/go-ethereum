@@ -18,186 +18,128 @@ package core
 
 import (
 	"errors"
-	"fmt"
-	"math/big"
 
-	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 )
 
 var (
-	BlockNumberErr   = errors.New("block number invalid")
-	BlockFutureErr   = errors.New("block time is in the future")
-	BlockTSTooBigErr = errors.New("block time too big")
-	BlockEqualTSErr  = errors.New("block time stamp equal to previous")
+	// ErrKnownBlock is returned when a block to import is already known locally.
+	ErrKnownBlock = errors.New("block already known")
+
+	// ErrNoGenesis is returned when there is no Genesis Block.
+	ErrNoGenesis = errors.New("genesis not found in chain")
+
+	// ErrBlockOversized is returned if the size of the RLP-encoded block
+	// exceeds the cap established by EIP 7934
+	ErrBlockOversized = errors.New("block RLP-encoded size exceeds maximum")
 )
 
-// Parent error. In case a parent is unknown this error will be thrown
-// by the block manager
-type ParentErr struct {
-	Message string
-}
+// List of evm-call-message pre-checking errors. All state transition messages will
+// be pre-checked before execution. If any invalidation detected, the corresponding
+// error should be returned which is defined here.
+//
+// - If the pre-checking happens in the miner, then the transaction won't be packed.
+// - If the pre-checking happens in the block processing procedure, then a "BAD BLOCk"
+// error should be emitted.
+var (
+	// ErrNonceTooLow is returned if the nonce of a transaction is lower than the
+	// one present in the local chain.
+	ErrNonceTooLow = errors.New("nonce too low")
 
-func (err *ParentErr) Error() string {
-	return err.Message
-}
+	// ErrNonceTooHigh is returned if the nonce of a transaction is higher than the
+	// next one expected based on the local chain.
+	ErrNonceTooHigh = errors.New("nonce too high")
 
-func ParentError(hash common.Hash) error {
-	return &ParentErr{Message: fmt.Sprintf("Block's parent unknown %x", hash)}
-}
+	// ErrNonceMax is returned if the nonce of a transaction sender account has
+	// maximum allowed value and would become invalid if incremented.
+	ErrNonceMax = errors.New("nonce has max value")
 
-func IsParentErr(err error) bool {
-	_, ok := err.(*ParentErr)
-	return ok
-}
+	// ErrGasLimitReached is returned by the gas pool if the amount of gas required
+	// by a transaction is higher than what's left in the block.
+	ErrGasLimitReached = errors.New("gas limit reached")
 
-type UncleErr struct {
-	Message string
-}
+	// ErrGasLimitOverflow is returned by the gas pool if the remaining gas
+	// exceeds the maximum value of uint64.
+	ErrGasLimitOverflow = errors.New("gas limit overflow")
 
-func (err *UncleErr) Error() string {
-	return err.Message
-}
+	// ErrInsufficientFundsForTransfer is returned if the transaction sender doesn't
+	// have enough funds for transfer(topmost call only).
+	ErrInsufficientFundsForTransfer = errors.New("insufficient funds for transfer")
 
-func UncleError(format string, v ...interface{}) error {
-	return &UncleErr{Message: fmt.Sprintf(format, v...)}
-}
+	// ErrInsufficientFunds is returned if the total cost of executing a transaction
+	// is higher than the balance of the user's account.
+	ErrInsufficientFunds = errors.New("insufficient funds for gas * price + value")
 
-func IsUncleErr(err error) bool {
-	_, ok := err.(*UncleErr)
-	return ok
-}
+	// ErrGasUintOverflow is returned when calculating gas usage.
+	ErrGasUintOverflow = errors.New("gas uint64 overflow")
 
-// Block validation error. If any validation fails, this error will be thrown
-type ValidationErr struct {
-	Message string
-}
+	// ErrIntrinsicGas is returned if the transaction is specified to use less gas
+	// than required to start the invocation.
+	ErrIntrinsicGas = errors.New("intrinsic gas too low")
 
-func (err *ValidationErr) Error() string {
-	return err.Message
-}
+	// ErrFloorDataGas is returned if the transaction is specified to use less gas
+	// than required for the data floor cost.
+	ErrFloorDataGas = errors.New("insufficient gas for floor data gas cost")
 
-func ValidationError(format string, v ...interface{}) *ValidationErr {
-	return &ValidationErr{Message: fmt.Sprintf(format, v...)}
-}
+	// ErrTxTypeNotSupported is returned if a transaction is not supported in the
+	// current network configuration.
+	ErrTxTypeNotSupported = types.ErrTxTypeNotSupported
 
-func IsValidationErr(err error) bool {
-	_, ok := err.(*ValidationErr)
-	return ok
-}
+	// ErrTipAboveFeeCap is a sanity error to ensure no one is able to specify a
+	// transaction with a tip higher than the total fee cap.
+	ErrTipAboveFeeCap = errors.New("max priority fee per gas higher than max fee per gas")
 
-type NonceErr struct {
-	Message string
-	Is, Exp uint64
-}
+	// ErrTipVeryHigh is a sanity error to avoid extremely big numbers specified
+	// in the tip field.
+	ErrTipVeryHigh = errors.New("max priority fee per gas higher than 2^256-1")
 
-func (err *NonceErr) Error() string {
-	return err.Message
-}
+	// ErrFeeCapVeryHigh is a sanity error to avoid extremely big numbers specified
+	// in the fee cap field.
+	ErrFeeCapVeryHigh = errors.New("max fee per gas higher than 2^256-1")
 
-func NonceError(is, exp uint64) *NonceErr {
-	return &NonceErr{Message: fmt.Sprintf("Transaction w/ invalid nonce. tx=%d  state=%d)", is, exp), Is: is, Exp: exp}
-}
+	// ErrFeeCapTooLow is returned if the transaction fee cap is less than the
+	// base fee of the block.
+	ErrFeeCapTooLow = errors.New("max fee per gas less than block base fee")
 
-func IsNonceErr(err error) bool {
-	_, ok := err.(*NonceErr)
-	return ok
-}
+	// ErrSenderNoEOA is returned if the sender of a transaction is a contract.
+	ErrSenderNoEOA = errors.New("sender not an eoa")
 
-// BlockNonceErr indicates that a block's nonce is invalid.
-type BlockNonceErr struct {
-	Number *big.Int
-	Hash   common.Hash
-	Nonce  uint64
-}
+	// -- EIP-4844 errors --
 
-func (err *BlockNonceErr) Error() string {
-	return fmt.Sprintf("nonce for #%d [%x…] is invalid (got %d)", err.Number, err.Hash, err.Nonce)
-}
+	// ErrBlobFeeCapTooLow is returned if the transaction fee cap is less than the
+	// blob gas fee of the block.
+	ErrBlobFeeCapTooLow = errors.New("max fee per blob gas less than block blob gas fee")
 
-// IsBlockNonceErr returns true for invalid block nonce errors.
-func IsBlockNonceErr(err error) bool {
-	_, ok := err.(*BlockNonceErr)
-	return ok
-}
+	// ErrMissingBlobHashes is returned if a blob transaction has no blob hashes.
+	ErrMissingBlobHashes = errors.New("blob transaction missing blob hashes")
 
-type InvalidTxErr struct {
-	Message string
-}
+	// ErrTooManyBlobs is returned if a blob transaction exceeds the maximum number of blobs.
+	ErrTooManyBlobs = errors.New("blob transaction has too many blobs")
 
-func (err *InvalidTxErr) Error() string {
-	return err.Message
-}
+	// ErrBlobTxCreate is returned if a blob transaction has no explicit to field.
+	ErrBlobTxCreate = errors.New("blob transaction of type create")
 
-func InvalidTxError(err error) *InvalidTxErr {
-	return &InvalidTxErr{fmt.Sprintf("%v", err)}
-}
+	// -- EIP-7702 errors --
 
-func IsInvalidTxErr(err error) bool {
-	_, ok := err.(*InvalidTxErr)
-	return ok
-}
+	// Message validation errors:
+	ErrEmptyAuthList   = errors.New("EIP-7702 transaction with empty auth list")
+	ErrSetCodeTxCreate = errors.New("EIP-7702 transaction cannot be used to create contract")
 
-type TDError struct {
-	a, b *big.Int
-}
+	// -- EIP-7825 errors --
+	ErrGasLimitTooHigh = errors.New("transaction gas limit too high")
+)
 
-func (self *TDError) Error() string {
-	return fmt.Sprintf("incoming chain has a lower or equal TD (%v <= %v)", self.a, self.b)
-}
-func IsTDError(e error) bool {
-	_, ok := e.(*TDError)
-	return ok
-}
+// EIP-7702 state transition errors.
+// Note these are just informational, and do not cause tx execution abort.
+var (
+	ErrAuthorizationWrongChainID       = errors.New("EIP-7702 authorization chain ID mismatch")
+	ErrAuthorizationNonceOverflow      = errors.New("EIP-7702 authorization nonce > 64 bit")
+	ErrAuthorizationInvalidSignature   = errors.New("EIP-7702 authorization has invalid signature")
+	ErrAuthorizationDestinationHasCode = errors.New("EIP-7702 authorization destination is a contract")
+	ErrAuthorizationNonceMismatch      = errors.New("EIP-7702 authorization nonce does not match current account nonce")
 
-type KnownBlockError struct {
-	number *big.Int
-	hash   common.Hash
-}
-
-func (self *KnownBlockError) Error() string {
-	return fmt.Sprintf("block %v already known (%x)", self.number, self.hash[0:4])
-}
-func IsKnownBlockErr(e error) bool {
-	_, ok := e.(*KnownBlockError)
-	return ok
-}
-
-type ValueTransferError struct {
-	message string
-}
-
-func ValueTransferErr(str string, v ...interface{}) *ValueTransferError {
-	return &ValueTransferError{fmt.Sprintf(str, v...)}
-}
-
-func (self *ValueTransferError) Error() string {
-	return self.message
-}
-func IsValueTransferErr(e error) bool {
-	_, ok := e.(*ValueTransferError)
-	return ok
-}
-
-type BadHashError common.Hash
-
-func (h BadHashError) Error() string {
-	return fmt.Sprintf("Found known bad hash in chain %x", h[:])
-}
-
-func IsBadHashError(err error) bool {
-	_, ok := err.(BadHashError)
-	return ok
-}
-
-type GasLimitErr struct {
-	Have, Want *big.Int
-}
-
-func IsGasLimitErr(err error) bool {
-	_, ok := err.(*GasLimitErr)
-	return ok
-}
-
-func (err *GasLimitErr) Error() string {
-	return fmt.Sprintf("GasLimit reached. Have %d gas, transaction requires %d", err.Have, err.Want)
-}
+	// ErrOutOfGasRuntime is returned when the transaction's gas budget cannot
+	// cover an EIP-2780 runtime charge. The transaction remains valid: the top
+	// frame halts out of gas and its state changes are reverted.
+	ErrOutOfGasRuntime = errors.New("out of gas covering EIP-2780 runtime charge")
+)

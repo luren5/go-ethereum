@@ -17,22 +17,19 @@
 package vm
 
 import (
-	"math/big"
 	"testing"
 
-	"github.com/ethereum/go-ethereum/params"
+	"github.com/stretchr/testify/require"
 )
 
-func TestInit(t *testing.T) {
-	jumpTable := newJumpTable(&params.ChainConfig{HomesteadBlock: big.NewInt(1)}, big.NewInt(0))
-	if jumpTable[DELEGATECALL].valid {
-		t.Error("Expected DELEGATECALL not to be present")
-	}
+// TestJumpTableCopy tests that deep copy is necessary to prevent modify shared jump table
+func TestJumpTableCopy(t *testing.T) {
+	tbl := newMergeInstructionSet()
+	require.Equal(t, uint64(0), tbl[SLOAD].constantGas)
 
-	for _, n := range []int64{1, 2, 100} {
-		jumpTable := newJumpTable(&params.ChainConfig{HomesteadBlock: big.NewInt(1)}, big.NewInt(n))
-		if !jumpTable[DELEGATECALL].valid {
-			t.Error("Expected DELEGATECALL to be present for block", n)
-		}
-	}
+	// a deep copy won't modify the shared jump table
+	deepCopy := copyJumpTable(&tbl)
+	deepCopy[SLOAD].constantGas = 100
+	require.Equal(t, uint64(100), deepCopy[SLOAD].constantGas)
+	require.Equal(t, uint64(0), tbl[SLOAD].constantGas)
 }

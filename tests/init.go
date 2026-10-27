@@ -14,107 +14,834 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-// Package tests implements execution of Ethereum JSON tests.
 package tests
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
-	"io/ioutil"
-	"net/http"
-	"os"
-	"path/filepath"
+	"math/big"
+	"sort"
+
+	"github.com/ethereum/go-ethereum/params"
 )
 
-var (
-	baseDir            = filepath.Join(".", "files")
-	blockTestDir       = filepath.Join(baseDir, "BlockchainTests")
-	stateTestDir       = filepath.Join(baseDir, "StateTests")
-	transactionTestDir = filepath.Join(baseDir, "TransactionTests")
-	vmTestDir          = filepath.Join(baseDir, "VMTests")
-	rlpTestDir         = filepath.Join(baseDir, "RLPTests")
+func u64(val uint64) *uint64 { return &val }
 
-	BlockSkipTests = []string{
-		// These tests are not valid, as they are out of scope for RLP and
-		// the consensus protocol.
-		"BLOCK__RandomByteAtTheEnd",
-		"TRANSCT__RandomByteAtTheEnd",
-		"BLOCK__ZeroByteAtTheEnd",
-		"TRANSCT__ZeroByteAtTheEnd",
-
-		"ChainAtoChainB_blockorder2",
-		"ChainAtoChainB_blockorder1",
-
-		"GasLimitHigherThan2p63m1", // not yet ;)
-		"SuicideIssue",             // fails genesis check
-	}
-
-	/* Go client does not support transaction (account) nonces above 2^64. This
-	technically breaks consensus but is regarded as "reasonable
-	engineering constraint" as accounts cannot easily reach such high
-	nonce values in practice
-	*/
-	TransSkipTests = []string{
-		"TransactionWithHihghNonce256",
-	}
-	StateSkipTests = []string{}
-	VmSkipTests    = []string{}
-)
-
-func readJson(reader io.Reader, value interface{}) error {
-	data, err := ioutil.ReadAll(reader)
-	if err != nil {
-		return fmt.Errorf("error reading JSON file: %v", err)
-	}
-	if err = json.Unmarshal(data, &value); err != nil {
-		if syntaxerr, ok := err.(*json.SyntaxError); ok {
-			line := findLine(data, syntaxerr.Offset)
-			return fmt.Errorf("JSON syntax error at line %v: %v", line, err)
-		}
-		return fmt.Errorf("JSON unmarshal error: %v", err)
-	}
-	return nil
+// Forks table defines supported forks and their chain config.
+var Forks = map[string]*params.ChainConfig{
+	"Frontier": {
+		ChainID: big.NewInt(1),
+	},
+	"Homestead": {
+		ChainID:        big.NewInt(1),
+		HomesteadBlock: big.NewInt(0),
+	},
+	"EIP150": {
+		ChainID:        big.NewInt(1),
+		HomesteadBlock: big.NewInt(0),
+		EIP150Block:    big.NewInt(0),
+	},
+	"EIP158": {
+		ChainID:        big.NewInt(1),
+		HomesteadBlock: big.NewInt(0),
+		EIP150Block:    big.NewInt(0),
+		EIP155Block:    big.NewInt(0),
+		EIP158Block:    big.NewInt(0),
+	},
+	"Byzantium": {
+		ChainID:        big.NewInt(1),
+		HomesteadBlock: big.NewInt(0),
+		EIP150Block:    big.NewInt(0),
+		EIP155Block:    big.NewInt(0),
+		EIP158Block:    big.NewInt(0),
+		DAOForkBlock:   big.NewInt(0),
+		ByzantiumBlock: big.NewInt(0),
+	},
+	"Constantinople": {
+		ChainID:             big.NewInt(1),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		DAOForkBlock:        big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(10000000),
+	},
+	"ConstantinopleFix": {
+		ChainID:             big.NewInt(1),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		DAOForkBlock:        big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(0),
+	},
+	"Istanbul": {
+		ChainID:             big.NewInt(1),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		DAOForkBlock:        big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(0),
+		IstanbulBlock:       big.NewInt(0),
+	},
+	"MuirGlacier": {
+		ChainID:             big.NewInt(1),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		DAOForkBlock:        big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(0),
+		IstanbulBlock:       big.NewInt(0),
+		MuirGlacierBlock:    big.NewInt(0),
+	},
+	"FrontierToHomesteadAt5": {
+		ChainID:        big.NewInt(1),
+		HomesteadBlock: big.NewInt(5),
+	},
+	"HomesteadToEIP150At5": {
+		ChainID:        big.NewInt(1),
+		HomesteadBlock: big.NewInt(0),
+		EIP150Block:    big.NewInt(5),
+	},
+	"HomesteadToDaoAt5": {
+		ChainID:        big.NewInt(1),
+		HomesteadBlock: big.NewInt(0),
+		DAOForkBlock:   big.NewInt(5),
+		DAOForkSupport: true,
+	},
+	"EIP158ToByzantiumAt5": {
+		ChainID:        big.NewInt(1),
+		HomesteadBlock: big.NewInt(0),
+		EIP150Block:    big.NewInt(0),
+		EIP155Block:    big.NewInt(0),
+		EIP158Block:    big.NewInt(0),
+		ByzantiumBlock: big.NewInt(5),
+	},
+	"ByzantiumToConstantinopleAt5": {
+		ChainID:             big.NewInt(1),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(5),
+	},
+	"ByzantiumToConstantinopleFixAt5": {
+		ChainID:             big.NewInt(1),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(5),
+		PetersburgBlock:     big.NewInt(5),
+	},
+	"ConstantinopleFixToIstanbulAt5": {
+		ChainID:             big.NewInt(1),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(0),
+		IstanbulBlock:       big.NewInt(5),
+	},
+	"Berlin": {
+		ChainID:             big.NewInt(1),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(0),
+		IstanbulBlock:       big.NewInt(0),
+		MuirGlacierBlock:    big.NewInt(0),
+		BerlinBlock:         big.NewInt(0),
+	},
+	"BerlinToLondonAt5": {
+		ChainID:             big.NewInt(1),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(0),
+		IstanbulBlock:       big.NewInt(0),
+		MuirGlacierBlock:    big.NewInt(0),
+		BerlinBlock:         big.NewInt(0),
+		LondonBlock:         big.NewInt(5),
+	},
+	"London": {
+		ChainID:             big.NewInt(1),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(0),
+		IstanbulBlock:       big.NewInt(0),
+		MuirGlacierBlock:    big.NewInt(0),
+		BerlinBlock:         big.NewInt(0),
+		LondonBlock:         big.NewInt(0),
+	},
+	"ArrowGlacier": {
+		ChainID:             big.NewInt(1),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(0),
+		IstanbulBlock:       big.NewInt(0),
+		MuirGlacierBlock:    big.NewInt(0),
+		BerlinBlock:         big.NewInt(0),
+		LondonBlock:         big.NewInt(0),
+		ArrowGlacierBlock:   big.NewInt(0),
+	},
+	"ArrowGlacierToParisAtDiffC0000": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		GrayGlacierBlock:        big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0xC0000),
+	},
+	"GrayGlacier": {
+		ChainID:             big.NewInt(1),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(0),
+		IstanbulBlock:       big.NewInt(0),
+		MuirGlacierBlock:    big.NewInt(0),
+		BerlinBlock:         big.NewInt(0),
+		LondonBlock:         big.NewInt(0),
+		ArrowGlacierBlock:   big.NewInt(0),
+		GrayGlacierBlock:    big.NewInt(0),
+	},
+	"Paris": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+	},
+	"Merge": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+	},
+	"Shanghai": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+	},
+	"ParisToShanghaiAtTime15k": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(15_000),
+	},
+	"Cancun": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+		},
+	},
+	"ShanghaiToCancunAtTime15k": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(15_000),
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+		},
+	},
+	"Prague": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+		},
+	},
+	"CancunToPragueAtTime15k": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(15_000),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+		},
+	},
+	"Osaka": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+		},
+	},
+	"PragueToOsakaAtTime15k": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(15_000),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+		},
+	},
+	"BPO1": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		BPO1Time:                u64(0),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+			BPO1:   params.DefaultBPO1BlobConfig,
+		},
+	},
+	"OsakaToBPO1AtTime15k": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		BPO1Time:                u64(15_000),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+			BPO1:   params.DefaultBPO1BlobConfig,
+		},
+	},
+	"BPO2": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		BPO1Time:                u64(0),
+		BPO2Time:                u64(0),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+			BPO1:   params.DefaultBPO1BlobConfig,
+			BPO2:   params.DefaultBPO2BlobConfig,
+		},
+	},
+	"BPO1ToBPO2AtTime15k": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		BPO1Time:                u64(0),
+		BPO2Time:                u64(15_000),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+			BPO1:   params.DefaultBPO1BlobConfig,
+			BPO2:   params.DefaultBPO2BlobConfig,
+		},
+	},
+	"BPO3": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		BPO1Time:                u64(0),
+		BPO2Time:                u64(0),
+		BPO3Time:                u64(0),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+			BPO1:   params.DefaultBPO1BlobConfig,
+			BPO2:   params.DefaultBPO2BlobConfig,
+			BPO3:   params.DefaultBPO3BlobConfig,
+		},
+	},
+	"BPO2ToBPO3AtTime15k": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		BPO1Time:                u64(0),
+		BPO2Time:                u64(0),
+		BPO3Time:                u64(15_000),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+			BPO1:   params.DefaultBPO1BlobConfig,
+			BPO2:   params.DefaultBPO2BlobConfig,
+			BPO3:   params.DefaultBPO3BlobConfig,
+		},
+	},
+	"BPO4": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		BPO1Time:                u64(0),
+		BPO2Time:                u64(0),
+		BPO3Time:                u64(0),
+		BPO4Time:                u64(0),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+			BPO1:   params.DefaultBPO1BlobConfig,
+			BPO2:   params.DefaultBPO2BlobConfig,
+			BPO3:   params.DefaultBPO3BlobConfig,
+			BPO4:   params.DefaultBPO4BlobConfig,
+		},
+	},
+	"BPO3ToBPO4AtTime15k": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		BPO1Time:                u64(0),
+		BPO2Time:                u64(0),
+		BPO3Time:                u64(0),
+		BPO4Time:                u64(15_000),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+			BPO1:   params.DefaultBPO1BlobConfig,
+			BPO2:   params.DefaultBPO2BlobConfig,
+			BPO3:   params.DefaultBPO3BlobConfig,
+			BPO4:   params.DefaultBPO4BlobConfig,
+		},
+	},
+	"Amsterdam": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		BPO1Time:                u64(0),
+		BPO2Time:                u64(0),
+		AmsterdamTime:           u64(0),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+			BPO1:   params.DefaultBPO1BlobConfig,
+			BPO2:   params.DefaultBPO2BlobConfig,
+		},
+	},
+	"BPO2ToAmsterdamAtTime15k": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		BPO1Time:                u64(0),
+		BPO2Time:                u64(0),
+		AmsterdamTime:           u64(15_000),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+			BPO1:   params.DefaultBPO1BlobConfig,
+			BPO2:   params.DefaultBPO2BlobConfig,
+		},
+	},
+	"Verkle": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		UBTTime:                 u64(0),
+	},
+	"Binary": {
+		ChainID:                 big.NewInt(1),
+		HomesteadBlock:          big.NewInt(0),
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: big.NewInt(0),
+		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		UBTTime:                 u64(0),
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+		},
+	},
 }
 
-func readJsonHttp(uri string, value interface{}) error {
-	resp, err := http.Get(uri)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	err = readJson(resp.Body, value)
-	if err != nil {
-		return err
-	}
-	return nil
+func init() {
+	// Execution-spec-tests fixtures use the historical upgrade names for
+	// the EIP150 and EIP158 rulesets.
+	Forks["TangerineWhistle"] = Forks["EIP150"]
+	Forks["SpuriousDragon"] = Forks["EIP158"]
 }
 
-func readJsonFile(fn string, value interface{}) error {
-	file, err := os.Open(fn)
-	if err != nil {
-		return err
+// AvailableForks returns the set of defined fork names
+func AvailableForks() []string {
+	var availableForks []string
+	for k := range Forks {
+		availableForks = append(availableForks, k)
 	}
-	defer file.Close()
-
-	err = readJson(file, value)
-	if err != nil {
-		return fmt.Errorf("%s in file %s", err.Error(), fn)
-	}
-	return nil
+	sort.Strings(availableForks)
+	return availableForks
 }
 
-// findLine returns the line number for the given offset into data.
-func findLine(data []byte, offset int64) (line int) {
-	line = 1
-	for i, r := range string(data) {
-		if int64(i) >= offset {
-			return
-		}
-		if r == '\n' {
-			line++
-		}
-	}
-	return
+// UnsupportedForkError is returned when a test requests a fork that isn't implemented.
+type UnsupportedForkError struct {
+	Name string
+}
+
+func (e UnsupportedForkError) Error() string {
+	return fmt.Sprintf("unsupported fork %q", e.Name)
 }

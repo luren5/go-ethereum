@@ -19,202 +19,261 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
-	"math/big"
+	"io/fs"
 	"os"
-	"runtime"
-	"time"
+	"path/filepath"
 
-	"github.com/ethereum/go-ethereum/cmd/utils"
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/cmd/evm/internal/t8ntool"
 	"github.com/ethereum/go-ethereum/core/state"
-	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethdb"
-	"github.com/ethereum/go-ethereum/logger/glog"
+	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/eth/tracers/logger"
+	"github.com/ethereum/go-ethereum/internal/debug"
+	"github.com/ethereum/go-ethereum/internal/flags"
 	"github.com/ethereum/go-ethereum/params"
-	"gopkg.in/urfave/cli.v1"
+	"github.com/urfave/cli/v2"
+
+	// Force-load the tracer engines to trigger registration
+	_ "github.com/ethereum/go-ethereum/eth/tracers/js"
+	_ "github.com/ethereum/go-ethereum/eth/tracers/native"
 )
 
-var gitCommit = "" // Git SHA1 commit hash of the release (set via linker flags)
+// Some other nice-to-haves:
+// * accumulate traces into an object to bundle with test
+// * write tx identifier for trace before hand (blocktest only)
+// * combine blocktest and statetest runner logic using unified test interface
+
+const traceCategory = "TRACING"
 
 var (
-	app = utils.NewApp(gitCommit, "the evm command line interface")
+	// Test running flags.
+	RunFlag = &cli.StringFlag{
+		Name:  "run",
+		Value: ".*",
+		Usage: "Run only those tests matching the regular expression.",
+	}
+	BenchFlag = &cli.BoolFlag{
+		Name:     "bench",
+		Usage:    "benchmark the execution",
+		Category: flags.VMCategory,
+	}
+	FuzzFlag = &cli.BoolFlag{
+		Name:     "fuzz",
+		Usage:    "adapts output format for fuzzing",
+		Category: flags.VMCategory,
+	}
+	WitnessCrossCheckFlag = &cli.BoolFlag{
+		Name:    "cross-check",
+		Aliases: []string{"xc"},
+		Usage:   "Cross-check stateful execution against stateless, verifying the witness generation.",
+	}
 
-	DebugFlag = cli.BoolFlag{
-		Name:  "debug",
-		Usage: "output full trace logs",
-	}
-	ForceJitFlag = cli.BoolFlag{
-		Name:  "forcejit",
-		Usage: "forces jit compilation",
-	}
-	DisableJitFlag = cli.BoolFlag{
-		Name:  "nojit",
-		Usage: "disabled jit compilation",
-	}
-	CodeFlag = cli.StringFlag{
-		Name:  "code",
-		Usage: "EVM code",
-	}
-	CodeFileFlag = cli.StringFlag{
-		Name:  "codefile",
-		Usage: "file containing EVM code",
-	}
-	GasFlag = cli.StringFlag{
-		Name:  "gas",
-		Usage: "gas limit for the evm",
-		Value: "10000000000",
-	}
-	PriceFlag = cli.StringFlag{
-		Name:  "price",
-		Usage: "price set for the evm",
-		Value: "0",
-	}
-	ValueFlag = cli.StringFlag{
-		Name:  "value",
-		Usage: "value set for the evm",
-		Value: "0",
-	}
-	DumpFlag = cli.BoolFlag{
+	// Debugging flags.
+	DumpFlag = &cli.BoolFlag{
 		Name:  "dump",
 		Usage: "dumps the state after the run",
 	}
-	InputFlag = cli.StringFlag{
-		Name:  "input",
-		Usage: "input for the EVM",
+	HumanReadableFlag = &cli.BoolFlag{
+		Name:  "human",
+		Usage: "\"Human-readable\" output",
 	}
-	SysStatFlag = cli.BoolFlag{
-		Name:  "sysstat",
-		Usage: "display system stats",
+	StatDumpFlag = &cli.BoolFlag{
+		Name:  "statdump",
+		Usage: "displays stack and heap memory information",
 	}
-	VerbosityFlag = cli.IntFlag{
-		Name:  "verbosity",
-		Usage: "sets the verbosity level",
+
+	// Tracing flags.
+	TraceFlag = &cli.BoolFlag{
+		Name:     "trace",
+		Usage:    "Enable tracing and output trace log.",
+		Category: traceCategory,
 	}
-	CreateFlag = cli.BoolFlag{
-		Name:  "create",
-		Usage: "indicates the action should be create rather than call",
+	TraceFormatFlag = &cli.StringFlag{
+		Name:     "trace.format",
+		Usage:    "Trace output format to use (json|struct|md)",
+		Value:    "json",
+		Category: traceCategory,
+	}
+	TraceDisableMemoryFlag = &cli.BoolFlag{
+		Name:     "trace.nomemory",
+		Aliases:  []string{"nomemory"},
+		Value:    true,
+		Usage:    "disable memory output",
+		Category: traceCategory,
+	}
+	TraceDisableStackFlag = &cli.BoolFlag{
+		Name:     "trace.nostack",
+		Aliases:  []string{"nostack"},
+		Usage:    "disable stack output",
+		Category: traceCategory,
+	}
+	TraceDisableStorageFlag = &cli.BoolFlag{
+		Name:     "trace.nostorage",
+		Aliases:  []string{"nostorage"},
+		Usage:    "disable storage output",
+		Category: traceCategory,
+	}
+	TraceDisableReturnDataFlag = &cli.BoolFlag{
+		Name:     "trace.noreturndata",
+		Aliases:  []string{"noreturndata"},
+		Value:    true,
+		Usage:    "disable return data output",
+		Category: traceCategory,
+	}
+
+	// Deprecated flags.
+	DebugFlag = &cli.BoolFlag{
+		Name:     "debug",
+		Usage:    "output full trace logs (deprecated)",
+		Hidden:   true,
+		Category: traceCategory,
+	}
+	MachineFlag = &cli.BoolFlag{
+		Name:     "json",
+		Usage:    "output trace logs in machine readable format, json (deprecated)",
+		Hidden:   true,
+		Category: traceCategory,
 	}
 )
 
-func init() {
-	app.Flags = []cli.Flag{
-		CreateFlag,
-		DebugFlag,
-		VerbosityFlag,
-		ForceJitFlag,
-		DisableJitFlag,
-		SysStatFlag,
-		CodeFlag,
-		CodeFileFlag,
-		GasFlag,
-		PriceFlag,
-		ValueFlag,
-		DumpFlag,
-		InputFlag,
+// Command definitions.
+var (
+	stateTransitionCommand = &cli.Command{
+		Name:    "transition",
+		Aliases: []string{"t8n"},
+		Usage:   "Executes a full state transition",
+		Action:  t8ntool.Transition,
+		Flags: []cli.Flag{
+			t8ntool.TraceFlag,
+			t8ntool.TraceTracerFlag,
+			t8ntool.TraceTracerConfigFlag,
+			t8ntool.TraceEnableMemoryFlag,
+			t8ntool.TraceDisableStackFlag,
+			t8ntool.TraceEnableReturnDataFlag,
+			t8ntool.TraceEnableCallFramesFlag,
+			t8ntool.OutputBasedir,
+			t8ntool.OutputAllocFlag,
+			t8ntool.OutputBTFlag,
+			t8ntool.OutputResultFlag,
+			t8ntool.OutputBodyFlag,
+			t8ntool.InputAllocFlag,
+			t8ntool.InputEnvFlag,
+			t8ntool.InputBTFlag,
+			t8ntool.InputTxsFlag,
+			t8ntool.ForknameFlag,
+			t8ntool.ChainIDFlag,
+			t8ntool.RewardFlag,
+			t8ntool.OpcodeCountFlag,
+		},
 	}
-	app.Action = run
+
+	verkleCommand = &cli.Command{
+		Name:    "verkle",
+		Aliases: []string{"vkt"},
+		Usage:   "Binary Trie helpers",
+		Subcommands: []*cli.Command{
+			{
+				Name:    "tree-keys",
+				Aliases: []string{"v"},
+				Usage:   "compute a set of binary trie keys, given their source addresses and optional slot numbers",
+				Action:  t8ntool.BinKeys,
+				Flags: []cli.Flag{
+					t8ntool.InputAllocFlag,
+				},
+			},
+			{
+				Name:    "single-key",
+				Aliases: []string{"vk"},
+				Usage:   "compute the binary trie key given an address and optional slot number",
+				Action:  t8ntool.BinKey,
+			},
+			{
+				Name:    "code-chunk-key",
+				Aliases: []string{"vck"},
+				Usage:   "compute the binary trie key given an address and chunk number",
+				Action:  t8ntool.BinaryCodeChunkKey,
+			},
+			{
+				Name:    "chunkify-code",
+				Aliases: []string{"vcc"},
+				Usage:   "chunkify a given bytecode for a binary trie",
+				Action:  t8ntool.BinaryCodeChunkCode,
+			},
+			{
+				Name:    "state-root",
+				Aliases: []string{"vsr"},
+				Usage:   "compute the state-root of a binary trie for the given alloc",
+				Action:  t8ntool.BinTrieRoot,
+				Flags: []cli.Flag{
+					t8ntool.InputAllocFlag,
+				},
+			},
+		},
+	}
+
+	transactionCommand = &cli.Command{
+		Name:    "transaction",
+		Aliases: []string{"t9n"},
+		Usage:   "Performs transaction validation",
+		Action:  t8ntool.Transaction,
+		Flags: []cli.Flag{
+			t8ntool.InputTxsFlag,
+			t8ntool.ChainIDFlag,
+			t8ntool.ForknameFlag,
+		},
+	}
+
+	blockBuilderCommand = &cli.Command{
+		Name:    "block-builder",
+		Aliases: []string{"b11r"},
+		Usage:   "Builds a block",
+		Action:  t8ntool.BuildBlock,
+		Flags: []cli.Flag{
+			t8ntool.OutputBasedir,
+			t8ntool.OutputBlockFlag,
+			t8ntool.InputHeaderFlag,
+			t8ntool.InputOmmersFlag,
+			t8ntool.InputWithdrawalsFlag,
+			t8ntool.InputTxsRlpFlag,
+			t8ntool.SealCliqueFlag,
+		},
+	}
+)
+
+// traceFlags contains flags that configure tracing output.
+var traceFlags = []cli.Flag{
+	TraceFlag,
+	TraceFormatFlag,
+	TraceDisableStackFlag,
+	TraceDisableMemoryFlag,
+	TraceDisableStorageFlag,
+	TraceDisableReturnDataFlag,
+
+	// deprecated
+	DebugFlag,
+	MachineFlag,
 }
 
-func run(ctx *cli.Context) error {
-	glog.SetToStderr(true)
-	glog.SetV(ctx.GlobalInt(VerbosityFlag.Name))
+var app = flags.NewApp("the evm command line interface")
 
-	db, _ := ethdb.NewMemDatabase()
-	statedb, _ := state.New(common.Hash{}, db)
-	sender := statedb.CreateAccount(common.StringToAddress("sender"))
-
-	logger := vm.NewStructLogger(nil)
-
-	vmenv := NewEnv(statedb, common.StringToAddress("evmuser"), common.Big(ctx.GlobalString(ValueFlag.Name)), vm.Config{
-		Debug:     ctx.GlobalBool(DebugFlag.Name),
-		ForceJit:  ctx.GlobalBool(ForceJitFlag.Name),
-		EnableJit: !ctx.GlobalBool(DisableJitFlag.Name),
-		Tracer:    logger,
-	})
-
-	tstart := time.Now()
-
-	var (
-		code []byte
-		ret  []byte
-		err  error
-	)
-
-	if ctx.GlobalString(CodeFlag.Name) != "" {
-		code = common.Hex2Bytes(ctx.GlobalString(CodeFlag.Name))
-	} else {
-		var hexcode []byte
-		if ctx.GlobalString(CodeFileFlag.Name) != "" {
-			var err error
-			hexcode, err = ioutil.ReadFile(ctx.GlobalString(CodeFileFlag.Name))
-			if err != nil {
-				fmt.Printf("Could not load code from file: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			var err error
-			hexcode, err = ioutil.ReadAll(os.Stdin)
-			if err != nil {
-				fmt.Printf("Could not load code from stdin: %v\n", err)
-				os.Exit(1)
-			}
-		}
-		code = common.Hex2Bytes(string(hexcode[:]))
+func init() {
+	app.Flags = debug.Flags
+	app.Commands = []*cli.Command{
+		runCommand,
+		blockTestCommand,
+		stateTestCommand,
+		stateTransitionCommand,
+		transactionCommand,
+		blockBuilderCommand,
+		verkleCommand,
 	}
-
-	if ctx.GlobalBool(CreateFlag.Name) {
-		input := append(code, common.Hex2Bytes(ctx.GlobalString(InputFlag.Name))...)
-		ret, _, err = vmenv.Create(
-			sender,
-			input,
-			common.Big(ctx.GlobalString(GasFlag.Name)),
-			common.Big(ctx.GlobalString(PriceFlag.Name)),
-			common.Big(ctx.GlobalString(ValueFlag.Name)),
-		)
-	} else {
-		receiver := statedb.CreateAccount(common.StringToAddress("receiver"))
-
-		receiver.SetCode(crypto.Keccak256Hash(code), code)
-		ret, err = vmenv.Call(
-			sender,
-			receiver.Address(),
-			common.Hex2Bytes(ctx.GlobalString(InputFlag.Name)),
-			common.Big(ctx.GlobalString(GasFlag.Name)),
-			common.Big(ctx.GlobalString(PriceFlag.Name)),
-			common.Big(ctx.GlobalString(ValueFlag.Name)),
-		)
+	app.Before = func(ctx *cli.Context) error {
+		flags.MigrateGlobalFlags(ctx)
+		return debug.Setup(ctx)
 	}
-	vmdone := time.Since(tstart)
-
-	if ctx.GlobalBool(DumpFlag.Name) {
-		statedb.Commit(true)
-		fmt.Println(string(statedb.Dump()))
+	app.After = func(ctx *cli.Context) error {
+		debug.Exit()
+		return nil
 	}
-	vm.StdErrFormat(logger.StructLogs())
-
-	if ctx.GlobalBool(SysStatFlag.Name) {
-		var mem runtime.MemStats
-		runtime.ReadMemStats(&mem)
-		fmt.Printf("vm took %v\n", vmdone)
-		fmt.Printf(`alloc:      %d
-tot alloc:  %d
-no. malloc: %d
-heap alloc: %d
-heap objs:  %d
-num gc:     %d
-`, mem.Alloc, mem.TotalAlloc, mem.Mallocs, mem.HeapAlloc, mem.HeapObjects, mem.NumGC)
-	}
-
-	fmt.Printf("OUT: 0x%x", ret)
-	if err != nil {
-		fmt.Printf(" error: %v", err)
-	}
-	fmt.Println()
-	return nil
 }
 
 func main() {
@@ -224,86 +283,67 @@ func main() {
 	}
 }
 
-type VMEnv struct {
-	state *state.StateDB
-	block *types.Block
-
-	transactor *common.Address
-	value      *big.Int
-
-	depth int
-	Gas   *big.Int
-	time  *big.Int
-	logs  []vm.StructLog
-
-	evm *vm.EVM
-}
-
-func NewEnv(state *state.StateDB, transactor common.Address, value *big.Int, cfg vm.Config) *VMEnv {
-	env := &VMEnv{
-		state:      state,
-		transactor: &transactor,
-		value:      value,
-		time:       big.NewInt(time.Now().Unix()),
+// tracerFromFlags parses the cli flags and returns the specified tracer.
+func tracerFromFlags(ctx *cli.Context) *tracing.Hooks {
+	config := &logger.Config{
+		EnableMemory:     !ctx.Bool(TraceDisableMemoryFlag.Name),
+		DisableStack:     ctx.Bool(TraceDisableStackFlag.Name),
+		DisableStorage:   ctx.Bool(TraceDisableStorageFlag.Name),
+		EnableReturnData: !ctx.Bool(TraceDisableReturnDataFlag.Name),
 	}
-
-	env.evm = vm.New(env, cfg)
-	return env
-}
-
-// ruleSet implements vm.ChainConfig and will always default to the homestead rule set.
-type ruleSet struct{}
-
-func (ruleSet) IsHomestead(*big.Int) bool { return true }
-func (ruleSet) GasTable(*big.Int) params.GasTable {
-	return params.GasTableHomesteadGasRepriceFork
-}
-
-func (self *VMEnv) ChainConfig() *params.ChainConfig { return params.TestChainConfig }
-func (self *VMEnv) Vm() vm.Vm                        { return self.evm }
-func (self *VMEnv) Db() vm.Database                  { return self.state }
-func (self *VMEnv) SnapshotDatabase() int            { return self.state.Snapshot() }
-func (self *VMEnv) RevertToSnapshot(snap int)        { self.state.RevertToSnapshot(snap) }
-func (self *VMEnv) Origin() common.Address           { return *self.transactor }
-func (self *VMEnv) BlockNumber() *big.Int            { return common.Big0 }
-func (self *VMEnv) Coinbase() common.Address         { return *self.transactor }
-func (self *VMEnv) Time() *big.Int                   { return self.time }
-func (self *VMEnv) Difficulty() *big.Int             { return common.Big1 }
-func (self *VMEnv) BlockHash() []byte                { return make([]byte, 32) }
-func (self *VMEnv) Value() *big.Int                  { return self.value }
-func (self *VMEnv) GasLimit() *big.Int               { return big.NewInt(1000000000) }
-func (self *VMEnv) VmType() vm.Type                  { return vm.StdVmTy }
-func (self *VMEnv) Depth() int                       { return 0 }
-func (self *VMEnv) SetDepth(i int)                   { self.depth = i }
-func (self *VMEnv) GetHash(n uint64) common.Hash {
-	if self.block.Number().Cmp(big.NewInt(int64(n))) == 0 {
-		return self.block.Hash()
+	switch {
+	case ctx.Bool(TraceFlag.Name):
+		switch format := ctx.String(TraceFormatFlag.Name); format {
+		case "struct":
+			return logger.NewStreamingStructLogger(config, os.Stderr).Hooks()
+		case "json":
+			return logger.NewJSONLogger(config, os.Stderr)
+		case "md", "markdown":
+			return logger.NewMarkdownLogger(config, os.Stderr).Hooks()
+		default:
+			fmt.Fprintf(os.Stderr, "unknown trace format: %q\n", format)
+			os.Exit(1)
+			return nil
+		}
+	// Deprecated ways of configuring tracing.
+	case ctx.Bool(MachineFlag.Name):
+		return logger.NewJSONLogger(config, os.Stderr)
+	case ctx.Bool(DebugFlag.Name):
+		return logger.NewStreamingStructLogger(config, os.Stderr).Hooks()
+	default:
+		return nil
 	}
-	return common.Hash{}
-}
-func (self *VMEnv) AddLog(log *vm.Log) {
-	self.state.AddLog(log)
-}
-func (self *VMEnv) CanTransfer(from common.Address, balance *big.Int) bool {
-	return self.state.GetBalance(from).Cmp(balance) >= 0
-}
-func (self *VMEnv) Transfer(from, to vm.Account, amount *big.Int) {
-	core.Transfer(from, to, amount)
 }
 
-func (self *VMEnv) Call(caller vm.ContractRef, addr common.Address, data []byte, gas, price, value *big.Int) ([]byte, error) {
-	self.Gas = gas
-	return core.Call(self, caller, addr, data, gas, price, value)
+// collectFiles walks the given path. If the path is a directory, it will
+// return a list of all accumulates all files with json extension.
+// Otherwise (if path points to a file), it will return the path.
+func collectFiles(path string) []string {
+	var out []string
+	if info, err := os.Stat(path); err == nil && !info.IsDir() {
+		// User explicitly pointed out a file, ignore extension.
+		return []string{path}
+	}
+	err := filepath.Walk(path, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && filepath.Ext(info.Name()) == ".json" {
+			out = append(out, path)
+		}
+		return nil
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	}
+	return out
 }
 
-func (self *VMEnv) CallCode(caller vm.ContractRef, addr common.Address, data []byte, gas, price, value *big.Int) ([]byte, error) {
-	return core.CallCode(self, caller, addr, data, gas, price, value)
-}
-
-func (self *VMEnv) DelegateCall(caller vm.ContractRef, addr common.Address, data []byte, gas, price *big.Int) ([]byte, error) {
-	return core.DelegateCall(self, caller, addr, data, gas, price)
-}
-
-func (self *VMEnv) Create(caller vm.ContractRef, data []byte, gas, price, value *big.Int) ([]byte, common.Address, error) {
-	return core.Create(self, caller, data, gas, price, value)
+// dump returns a state dump for the most current trie.
+func dump(s *state.StateDB) *state.Dump {
+	// A dump is not a state transition: report accounts exactly as they are.
+	root := s.IntermediateRoot(params.Rules{})
+	cpy, _ := state.New(root, s.Database())
+	dump := cpy.RawDump(nil)
+	return &dump
 }

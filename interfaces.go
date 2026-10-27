@@ -18,15 +18,18 @@
 package ethereum
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm"
-	"golang.org/x/net/context"
 )
 
-// TODO: move subscription to package event
+// NotFound is returned by API methods if the requested item does not exist.
+var NotFound = errors.New("not found")
 
 // Subscription represents an event subscription where events are
 // delivered on a data channel.
@@ -46,6 +49,8 @@ type Subscription interface {
 // blockchain fork that was previously downloaded and processed by the node. The block
 // number argument can be nil to select the latest canonical block. Reading block headers
 // should be preferred over full blocks whenever possible.
+//
+// The returned error is NotFound if the requested item does not exist.
 type ChainReader interface {
 	BlockByHash(ctx context.Context, hash common.Hash) (*types.Block, error)
 	BlockByNumber(ctx context.Context, number *big.Int) (*types.Block, error)
@@ -53,8 +58,43 @@ type ChainReader interface {
 	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
 	TransactionCount(ctx context.Context, blockHash common.Hash) (uint, error)
 	TransactionInBlock(ctx context.Context, blockHash common.Hash, index uint) (*types.Transaction, error)
-	TransactionByHash(ctx context.Context, txHash common.Hash) (*types.Transaction, error)
+
+	// This method subscribes to notifications about changes of the head block of
+	// the canonical chain.
+	SubscribeNewHead(ctx context.Context, ch chan<- *types.Header) (Subscription, error)
+}
+
+// TransactionReceiptsQuery defines criteria for transaction receipts subscription.
+// If TransactionHashes is empty, receipts for all transactions included in new blocks will be delivered.
+// Otherwise, only receipts for the specified transactions will be delivered.
+type TransactionReceiptsQuery struct {
+	TransactionHashes []common.Hash
+}
+
+// TransactionReader provides access to past transactions and their receipts.
+// Implementations may impose arbitrary restrictions on the transactions and receipts that
+// can be retrieved. Historic transactions may not be available.
+//
+// Avoid relying on this interface if possible. Contract logs (through the LogFilterer
+// interface) are more reliable and usually safer in the presence of chain
+// reorganisations.
+//
+// The returned error is NotFound if the requested item does not exist.
+type TransactionReader interface {
+	// TransactionByHash checks the pool of pending transactions in addition to the
+	// blockchain. The isPending return value indicates whether the transaction has been
+	// mined yet. Note that the transaction may not be part of the canonical chain even if
+	// it's not pending.
+	TransactionByHash(ctx context.Context, txHash common.Hash) (tx *types.Transaction, isPending bool, err error)
+	// TransactionReceipt returns the receipt of a mined transaction. Note that the
+	// transaction may not be included in the current canonical chain even if a receipt
+	// exists.
 	TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error)
+	// SubscribeTransactionReceipts subscribes to notifications about transaction receipts.
+	// The receipts are delivered in batches when transactions are included in blocks.
+	// If q is nil or has empty TransactionHashes, all receipts from new blocks will be delivered.
+	// Otherwise, only receipts for the specified transaction hashes will be delivered.
+	SubscribeTransactionReceipts(ctx context.Context, q *TransactionReceiptsQuery, ch chan<- []*types.Receipt) (Subscription, error)
 }
 
 // ChainStateReader wraps access to the state trie of the canonical blockchain. Note that
@@ -73,8 +113,48 @@ type SyncProgress struct {
 	StartingBlock uint64 // Block number where sync began
 	CurrentBlock  uint64 // Current block number where sync is at
 	HighestBlock  uint64 // Highest alleged block number in the chain
-	PulledStates  uint64 // Number of state trie entries already downloaded
-	KnownStates   uint64 // Total number os state trie entries known about
+
+	// "fast sync" fields. These used to be sent by geth, but are no longer used
+	// since version v1.10.
+	PulledStates uint64 // Number of state trie entries already downloaded
+	KnownStates  uint64 // Total number of state trie entries known about
+
+	// "snap sync" fields.
+	SyncedAccounts      uint64 // Number of accounts downloaded
+	SyncedAccountBytes  uint64 // Number of account trie bytes persisted to disk
+	SyncedBytecodes     uint64 // Number of bytecodes downloaded
+	SyncedBytecodeBytes uint64 // Number of bytecode bytes downloaded
+	SyncedStorage       uint64 // Number of storage slots downloaded
+	SyncedStorageBytes  uint64 // Number of storage trie bytes persisted to disk
+
+	// Snap/1 specific fields
+	HealedTrienodes     uint64 // Number of state trie nodes downloaded
+	HealedTrienodeBytes uint64 // Number of state trie bytes persisted to disk
+	HealedBytecodes     uint64 // Number of bytecodes downloaded
+	HealedBytecodeBytes uint64 // Number of bytecodes persisted to disk
+	HealingTrienodes    uint64 // Number of state trie nodes pending
+	HealingBytecode     uint64 // Number of bytecodes pending
+
+	// Snap/2 specific fields
+	SyncedAccessLists uint64 // Number of block access lists fetched during catch-up
+	TotalAccessLists  uint64 // Total number of block access lists to fetch for catch-up
+	TrieGenProgress   uint64 // Trie generation completion, in percent (0..100)
+
+	// "transaction indexing" fields
+	TxIndexFinishedBlocks  uint64 // Number of blocks whose transactions are already indexed
+	TxIndexRemainingBlocks uint64 // Number of blocks whose transactions are not indexed yet
+
+	// "historical data indexing" fields
+	StateIndexRemaining    uint64 // Number of states remain unindexed
+	TrienodeIndexRemaining uint64 // Number of trienodes remain unindexed
+}
+
+// Done returns the indicator if the initial sync is finished or not.
+func (prog SyncProgress) Done() bool {
+	if prog.CurrentBlock < prog.HighestBlock {
+		return false
+	}
+	return prog.TxIndexRemainingBlocks == 0 && prog.StateIndexRemaining == 0 && prog.TrienodeIndexRemaining == 0
 }
 
 // ChainSyncReader wraps access to the node's current sync status. If there's no
@@ -83,19 +163,25 @@ type ChainSyncReader interface {
 	SyncProgress(ctx context.Context) (*SyncProgress, error)
 }
 
-// A ChainHeadEventer returns notifications whenever the canonical head block is updated.
-type ChainHeadEventer interface {
-	SubscribeNewHead(ctx context.Context, ch chan<- *types.Header) (Subscription, error)
-}
-
 // CallMsg contains parameters for contract calls.
 type CallMsg struct {
-	From     common.Address  // the sender of the 'transaction'
-	To       *common.Address // the destination contract (nil for contract creation)
-	Gas      *big.Int        // if nil, the call executes with near-infinite gas
-	GasPrice *big.Int        // wei <-> gas exchange ratio
-	Value    *big.Int        // amount of wei sent along with the call
-	Data     []byte          // input data, usually an ABI-encoded contract method invocation
+	From      common.Address  // the sender of the 'transaction'
+	To        *common.Address // the destination contract (nil for contract creation)
+	Gas       uint64          // if 0, the call executes with near-infinite gas
+	GasPrice  *big.Int        // wei <-> gas exchange ratio
+	GasFeeCap *big.Int        // EIP-1559 fee cap per gas.
+	GasTipCap *big.Int        // EIP-1559 tip per gas.
+	Value     *big.Int        // amount of wei sent along with the call
+	Data      []byte          // input data, usually an ABI-encoded contract method invocation
+
+	AccessList types.AccessList // EIP-2930 access list.
+
+	// For BlobTxType
+	BlobGasFeeCap *big.Int
+	BlobHashes    []common.Hash
+
+	// For SetCodeTxType
+	AuthorizationList []types.SetCodeAuthorization
 }
 
 // A ContractCaller provides contract calls, essentially transactions that are executed by
@@ -106,8 +192,9 @@ type ContractCaller interface {
 	CallContract(ctx context.Context, call CallMsg, blockNumber *big.Int) ([]byte, error)
 }
 
-// FilterQuery contains options for contact log filtering.
+// FilterQuery contains options for contract log filtering.
 type FilterQuery struct {
+	BlockHash *common.Hash     // used by eth_getLogs, return logs only from block with this hash
 	FromBlock *big.Int         // beginning of the queried range, nil means genesis block
 	ToBlock   *big.Int         // end of the range, nil means latest block
 	Addresses []common.Address // restricts matches to events created by specific contracts
@@ -120,17 +207,20 @@ type FilterQuery struct {
 	// Examples:
 	// {} or nil          matches any topic list
 	// {{A}}              matches topic A in first position
-	// {{}, {B}}          matches any topic in first position, B in second position
-	// {{A}}, {B}}        matches topic A in first position, B in second position
-	// {{A, B}}, {C, D}}  matches topic (A OR B) in first position, (C OR D) in second position
+	// {{}, {B}}          matches any topic in first position AND B in second position
+	// {{A}, {B}}         matches topic A in first position AND B in second position
+	// {{A, B}, {C, D}}   matches topic (A OR B) in first position AND (C OR D) in second position
 	Topics [][]common.Hash
 }
 
 // LogFilterer provides access to contract log events using a one-off query or continuous
 // event subscription.
+//
+// Logs received through a streaming query subscription may have Removed set to true,
+// indicating that the log was reverted due to a chain reorganisation.
 type LogFilterer interface {
-	FilterLogs(ctx context.Context, q FilterQuery) ([]vm.Log, error)
-	SubscribeFilterLogs(ctx context.Context, q FilterQuery, ch chan<- vm.Log) (Subscription, error)
+	FilterLogs(ctx context.Context, q FilterQuery) ([]types.Log, error)
+	SubscribeFilterLogs(ctx context.Context, q FilterQuery, ch chan<- types.Log) (Subscription, error)
 }
 
 // TransactionSender wraps transaction sending. The SendTransaction method injects a
@@ -149,6 +239,25 @@ type TransactionSender interface {
 // optimal gas price given current fee market conditions.
 type GasPricer interface {
 	SuggestGasPrice(ctx context.Context) (*big.Int, error)
+}
+
+// GasPricer1559 provides access to the EIP-1559 gas price oracle.
+type GasPricer1559 interface {
+	SuggestGasTipCap(ctx context.Context) (*big.Int, error)
+}
+
+// FeeHistoryReader provides access to the fee history oracle.
+type FeeHistoryReader interface {
+	FeeHistory(ctx context.Context, blockCount uint64, lastBlock *big.Int, rewardPercentiles []float64) (*FeeHistory, error)
+}
+
+// FeeHistory provides recent fee market data that consumers can use to determine
+// a reasonable maxPriorityFeePerGas value.
+type FeeHistory struct {
+	OldestBlock  *big.Int     // block corresponding to first response value
+	Reward       [][]*big.Int // list every txs priority fee per block
+	BaseFee      []*big.Int   // list of each block's base fee
+	GasUsedRatio []float64    // ratio of gas used out of the total available limit
 }
 
 // A PendingStateReader provides access to the pending state, which is the result of all
@@ -174,11 +283,116 @@ type PendingContractCaller interface {
 // true gas limit requirement as other transactions may be added or removed by miners, but
 // it should provide a basis for setting a reasonable default.
 type GasEstimator interface {
-	EstimateGas(ctx context.Context, call CallMsg) (usedGas *big.Int, err error)
+	EstimateGas(ctx context.Context, call CallMsg) (uint64, error)
 }
 
 // A PendingStateEventer provides access to real time notifications about changes to the
 // pending state.
 type PendingStateEventer interface {
 	SubscribePendingTransactions(ctx context.Context, ch chan<- *types.Transaction) (Subscription, error)
+}
+
+// BlockNumberReader provides access to the current block number.
+type BlockNumberReader interface {
+	BlockNumber(ctx context.Context) (uint64, error)
+}
+
+// ChainIDReader provides access to the chain ID.
+type ChainIDReader interface {
+	ChainID(ctx context.Context) (*big.Int, error)
+}
+
+// OverrideAccount specifies the state of an account to be overridden.
+type OverrideAccount struct {
+	// Nonce sets nonce of the account. Note: the nonce override will only
+	// be applied when it is set to a non-zero value.
+	Nonce uint64
+
+	// Code sets the contract code. The override will be applied
+	// when the code is non-nil, i.e. setting empty code is possible
+	// using an empty slice.
+	Code []byte
+
+	// Balance sets the account balance.
+	Balance *big.Int
+
+	// State sets the complete storage. The override will be applied
+	// when the given map is non-nil. Using an empty map wipes the
+	// entire contract storage during the call.
+	State map[common.Hash]common.Hash
+
+	// StateDiff allows overriding individual storage slots.
+	StateDiff map[common.Hash]common.Hash
+}
+
+func (a OverrideAccount) MarshalJSON() ([]byte, error) {
+	type acc struct {
+		Nonce     hexutil.Uint64              `json:"nonce,omitempty"`
+		Code      string                      `json:"code,omitempty"`
+		Balance   *hexutil.Big                `json:"balance,omitempty"`
+		State     interface{}                 `json:"state,omitempty"`
+		StateDiff map[common.Hash]common.Hash `json:"stateDiff,omitempty"`
+	}
+
+	output := acc{
+		Nonce:     hexutil.Uint64(a.Nonce),
+		Balance:   (*hexutil.Big)(a.Balance),
+		StateDiff: a.StateDiff,
+	}
+	if a.Code != nil {
+		output.Code = hexutil.Encode(a.Code)
+	}
+	if a.State != nil {
+		output.State = a.State
+	}
+	return json.Marshal(output)
+}
+
+// BlockOverrides specifies the set of header fields to override.
+type BlockOverrides struct {
+	// Number overrides the block number.
+	Number *big.Int
+	// Difficulty overrides the block difficulty.
+	Difficulty *big.Int
+	// Time overrides the block timestamp. Time is applied only when
+	// it is non-zero.
+	Time uint64
+	// GasLimit overrides the block gas limit. GasLimit is applied only when
+	// it is non-zero.
+	GasLimit uint64
+	// Coinbase overrides the block coinbase. Coinbase is applied only when
+	// it is different from the zero address.
+	Coinbase common.Address
+	// Random overrides the block extra data which feeds into the RANDOM opcode.
+	// Random is applied only when it is a non-zero hash.
+	Random common.Hash
+	// BaseFee overrides the block base fee.
+	BaseFee *big.Int
+}
+
+func (o BlockOverrides) MarshalJSON() ([]byte, error) {
+	type override struct {
+		Number     *hexutil.Big    `json:"number,omitempty"`
+		Difficulty *hexutil.Big    `json:"difficulty,omitempty"`
+		Time       hexutil.Uint64  `json:"time,omitempty"`
+		GasLimit   hexutil.Uint64  `json:"gasLimit,omitempty"`
+		Coinbase   *common.Address `json:"feeRecipient,omitempty"`
+		Random     *common.Hash    `json:"prevRandao,omitempty"`
+		BaseFee    *hexutil.Big    `json:"baseFeePerGas,omitempty"`
+	}
+
+	output := override{
+		Number:     (*hexutil.Big)(o.Number),
+		Difficulty: (*hexutil.Big)(o.Difficulty),
+		Time:       hexutil.Uint64(o.Time),
+		GasLimit:   hexutil.Uint64(o.GasLimit),
+		BaseFee:    (*hexutil.Big)(o.BaseFee),
+	}
+	if o.Coinbase != (common.Address{}) {
+		output.Coinbase = &o.Coinbase
+	}
+	if o.Random != (common.Hash{}) {
+		output.Random = &o.Random
+	}
+	return json.Marshal(output)
 }

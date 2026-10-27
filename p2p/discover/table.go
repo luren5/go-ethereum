@@ -23,660 +23,801 @@
 package discover
 
 import (
-	"crypto/rand"
-	"encoding/binary"
-	"errors"
+	"context"
 	"fmt"
 	"net"
-	"sort"
+	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/logger"
-	"github.com/ethereum/go-ethereum/logger/glog"
+	"github.com/ethereum/go-ethereum/common/mclock"
+	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/metrics"
+	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/p2p/enr"
+	"github.com/ethereum/go-ethereum/p2p/netutil"
 )
 
 const (
-	alpha      = 3  // Kademlia concurrency factor
-	bucketSize = 16 // Kademlia bucket size
-	hashBits   = len(common.Hash{}) * 8
-	nBuckets   = hashBits + 1 // Number of buckets
+	alpha           = 3  // Kademlia concurrency factor
+	bucketSize      = 16 // Kademlia bucket size
+	maxReplacements = 10 // Size of per-bucket replacement list
 
-	maxBondingPingPongs = 16
-	maxFindnodeFailures = 5
+	// We keep buckets for the upper 1/15 of distances because
+	// it's very unlikely we'll ever encounter a node that's closer.
+	hashBits          = len(common.Hash{}) * 8
+	nBuckets          = hashBits / 15       // Number of buckets
+	bucketMinDistance = hashBits - nBuckets // Log distance of closest bucket
 
-	autoRefreshInterval = 1 * time.Hour
-	seedCount           = 30
-	seedMaxAge          = 5 * 24 * time.Hour
+	// IP address limits.
+	bucketIPLimit, bucketSubnet = 2, 24 // at most 2 addresses from the same /24
+	tableIPLimit, tableSubnet   = 10, 24
+
+	seedCount  = 30
+	seedMaxAge = 5 * 24 * time.Hour
 )
 
+// Table is the 'node table', a Kademlia-like index of neighbor nodes. The table keeps
+// itself up-to-date by verifying the liveness of neighbors and requesting their node
+// records when announcements of a new record version are received.
 type Table struct {
-	mutex   sync.Mutex        // protects buckets, their content, and nursery
-	buckets [nBuckets]*bucket // index of known nodes by distance
-	nursery []*Node           // bootstrap nodes
-	db      *nodeDB           // database of known nodes
+	mutex        sync.Mutex        // protects buckets, bucket content, nursery, rand
+	buckets      [nBuckets]*bucket // index of known nodes by distance
+	nursery      []*enode.Node     // bootstrap nodes
+	rand         reseedingRandom   // source of randomness, periodically reseeded
+	ips          netutil.DistinctNetSet
+	revalidation tableRevalidation
 
-	refreshReq chan chan struct{}
-	closeReq   chan struct{}
-	closed     chan struct{}
+	db  *enode.DB // database of known nodes
+	net transport
+	cfg Config
+	log log.Logger
 
-	bondmu    sync.Mutex
-	bonding   map[NodeID]*bondproc
-	bondslots chan struct{} // limits total number of active bonding processes
+	// loop channels
+	refreshReq      chan chan struct{}
+	revalResponseCh chan revalidationResponse
+	addNodeCh       chan addNodeOp
+	addNodeHandled  chan bool
+	trackRequestCh  chan trackRequestOp
+	initDone        chan struct{}
+	closeReq        chan struct{}
+	closed          chan struct{}
 
-	nodeAddedHook func(*Node) // for testing
-
-	net  transport
-	self *Node // metadata of the local node
+	nodeFeed        event.FeedOf[*enode.Node]
+	nodeAddedHook   func(*bucket, *tableNode)
+	nodeRemovedHook func(*bucket, *tableNode)
 }
 
-type bondproc struct {
-	err  error
-	n    *Node
-	done chan struct{}
-}
-
-// transport is implemented by the UDP transport.
-// it is an interface so we can test without opening lots of UDP
-// sockets and without generating a private key.
+// transport is implemented by the UDP transports.
 type transport interface {
-	ping(NodeID, *net.UDPAddr) error
-	waitping(NodeID) error
-	findnode(toid NodeID, addr *net.UDPAddr, target NodeID) ([]*Node, error)
-	close()
+	Self() *enode.Node
+	RequestENR(*enode.Node) (*enode.Node, error)
+	lookupRandom() []*enode.Node
+	lookupSelf() []*enode.Node
+	ping(*enode.Node) (seq uint64, err error)
 }
 
 // bucket contains nodes, ordered by their last activity. the entry
 // that was most recently active is the first element in entries.
-type bucket struct{ entries []*Node }
+type bucket struct {
+	entries      []*tableNode // live entries, sorted by time of last contact
+	replacements []*tableNode // recently seen nodes to be used if revalidation fails
+	ips          netutil.DistinctNetSet
+	index        int
+}
 
-func newTable(t transport, ourID NodeID, ourAddr *net.UDPAddr, nodeDBPath string) (*Table, error) {
-	// If no node database was given, use an in-memory one
-	db, err := newNodeDB(nodeDBPath, Version, ourID)
-	if err != nil {
-		return nil, err
-	}
+type addNodeOp struct {
+	node         *enode.Node
+	isInbound    bool
+	forceSetLive bool // for tests
+}
+
+type trackRequestOp struct {
+	node       *enode.Node
+	foundNodes []*enode.Node
+	success    bool
+}
+
+func newTable(t transport, db *enode.DB, cfg Config) (*Table, error) {
+	cfg = cfg.withDefaults()
 	tab := &Table{
-		net:        t,
-		db:         db,
-		self:       NewNode(ourID, ourAddr.IP, uint16(ourAddr.Port), uint16(ourAddr.Port)),
-		bonding:    make(map[NodeID]*bondproc),
-		bondslots:  make(chan struct{}, maxBondingPingPongs),
-		refreshReq: make(chan chan struct{}),
-		closeReq:   make(chan struct{}),
-		closed:     make(chan struct{}),
-	}
-	for i := 0; i < cap(tab.bondslots); i++ {
-		tab.bondslots <- struct{}{}
+		net:             t,
+		db:              db,
+		cfg:             cfg,
+		log:             cfg.Log,
+		refreshReq:      make(chan chan struct{}),
+		revalResponseCh: make(chan revalidationResponse),
+		addNodeCh:       make(chan addNodeOp),
+		addNodeHandled:  make(chan bool),
+		trackRequestCh:  make(chan trackRequestOp),
+		initDone:        make(chan struct{}),
+		closeReq:        make(chan struct{}),
+		closed:          make(chan struct{}),
+		ips:             netutil.DistinctNetSet{Subnet: tableSubnet, Limit: tableIPLimit},
 	}
 	for i := range tab.buckets {
-		tab.buckets[i] = new(bucket)
+		tab.buckets[i] = &bucket{
+			index: i,
+			ips:   netutil.DistinctNetSet{Subnet: bucketSubnet, Limit: bucketIPLimit},
+		}
 	}
-	go tab.refreshLoop()
+	tab.rand.seed()
+	tab.revalidation.init(&cfg)
+
+	// initial table content
+	if err := tab.setFallbackNodes(cfg.Bootnodes); err != nil {
+		return nil, err
+	}
+	tab.loadSeedNodes()
+
 	return tab, nil
 }
 
-// Self returns the local node.
-// The returned node should not be modified by the caller.
-func (tab *Table) Self() *Node {
-	return tab.self
-}
-
-// ReadRandomNodes fills the given slice with random nodes from the
-// table. It will not write the same node more than once. The nodes in
-// the slice are copies and can be modified by the caller.
-func (tab *Table) ReadRandomNodes(buf []*Node) (n int) {
+// Nodes returns all nodes contained in the table.
+func (tab *Table) Nodes() [][]BucketNode {
 	tab.mutex.Lock()
 	defer tab.mutex.Unlock()
-	// TODO: tree-based buckets would help here
-	// Find all non-empty buckets and get a fresh slice of their entries.
-	var buckets [][]*Node
-	for _, b := range tab.buckets {
-		if len(b.entries) > 0 {
-			buckets = append(buckets, b.entries[:])
+
+	nodes := make([][]BucketNode, len(tab.buckets))
+	for i, b := range &tab.buckets {
+		nodes[i] = make([]BucketNode, len(b.entries))
+		for j, n := range b.entries {
+			nodes[i][j] = BucketNode{
+				Node:          n.Node,
+				Checks:        int(n.livenessChecks),
+				Live:          n.isValidatedLive,
+				AddedToTable:  n.addedToTable,
+				AddedToBucket: n.addedToBucket,
+			}
 		}
 	}
-	if len(buckets) == 0 {
-		return 0
-	}
-	// Shuffle the buckets.
-	for i := uint32(len(buckets)) - 1; i > 0; i-- {
-		j := randUint(i)
-		buckets[i], buckets[j] = buckets[j], buckets[i]
-	}
-	// Move head of each bucket into buf, removing buckets that become empty.
-	var i, j int
-	for ; i < len(buf); i, j = i+1, (j+1)%len(buckets) {
-		b := buckets[j]
-		buf[i] = &(*b[0])
-		buckets[j] = b[1:]
-		if len(b) == 1 {
-			buckets = append(buckets[:j], buckets[j+1:]...)
-		}
-		if len(buckets) == 0 {
-			break
+	return nodes
+}
+
+func (tab *Table) self() *enode.Node {
+	return tab.net.Self()
+}
+
+// getNode returns the node with the given ID or nil if it isn't in the table.
+func (tab *Table) getNode(id enode.ID) *enode.Node {
+	tab.mutex.Lock()
+	defer tab.mutex.Unlock()
+
+	b := tab.bucket(id)
+	for _, e := range b.entries {
+		if e.ID() == id {
+			return e.Node
 		}
 	}
-	return i + 1
+	return nil
 }
 
-func randUint(max uint32) uint32 {
-	if max == 0 {
-		return 0
-	}
-	var b [4]byte
-	rand.Read(b[:])
-	return binary.BigEndian.Uint32(b[:]) % max
+// close terminates the network listener and flushes the node database.
+func (tab *Table) close() {
+	close(tab.closeReq)
+	<-tab.closed
 }
 
-// Close terminates the network listener and flushes the node database.
-func (tab *Table) Close() {
-	select {
-	case <-tab.closed:
-		// already closed.
-	case tab.closeReq <- struct{}{}:
-		<-tab.closed // wait for refreshLoop to end.
-	}
-}
-
-// SetFallbackNodes sets the initial points of contact. These nodes
+// setFallbackNodes sets the initial points of contact. These nodes
 // are used to connect to the network if the table is empty and there
 // are no known nodes in the database.
-func (tab *Table) SetFallbackNodes(nodes []*Node) error {
+func (tab *Table) setFallbackNodes(nodes []*enode.Node) error {
+	nursery := make([]*enode.Node, 0, len(nodes))
 	for _, n := range nodes {
-		if err := n.validateComplete(); err != nil {
-			return fmt.Errorf("bad bootstrap/fallback node %q (%v)", n, err)
+		if n.Hostname() != "" && !n.IPAddr().IsValid() {
+			resolved, err := resolveBootnodeHostname(n, tab.log)
+			if err != nil {
+				return fmt.Errorf("bad bootstrap node %q: %v", n, err)
+			}
+			n = resolved
 		}
+		if err := n.ValidateComplete(); err != nil {
+			return fmt.Errorf("bad bootstrap node %q: %v", n, err)
+		}
+		if tab.cfg.NetRestrict != nil && !tab.cfg.NetRestrict.ContainsAddr(n.IPAddr()) {
+			tab.log.Error("Bootstrap node filtered by netrestrict", "id", n.ID(), "ip", n.IPAddr())
+			continue
+		}
+		nursery = append(nursery, n)
 	}
-	tab.mutex.Lock()
-	tab.nursery = make([]*Node, 0, len(nodes))
-	for _, n := range nodes {
-		cpy := *n
-		// Recompute cpy.sha because the node might not have been
-		// created by NewNode or ParseNode.
-		cpy.sha = crypto.Keccak256Hash(n.ID[:])
-		tab.nursery = append(tab.nursery, &cpy)
-	}
-	tab.mutex.Unlock()
-	tab.refresh()
+	tab.nursery = nursery
 	return nil
 }
 
-// Resolve searches for a specific node with the given ID.
-// It returns nil if the node could not be found.
-func (tab *Table) Resolve(targetID NodeID) *Node {
-	// If the node is present in the local table, no
-	// network interaction is required.
-	hash := crypto.Keccak256Hash(targetID[:])
-	tab.mutex.Lock()
-	cl := tab.closest(hash, 1)
-	tab.mutex.Unlock()
-	if len(cl.entries) > 0 && cl.entries[0].ID == targetID {
-		return cl.entries[0]
+// resolveBootnodeHostname resolves the DNS hostname of a bootstrap node to an IP address.
+func resolveBootnodeHostname(n *enode.Node, logger log.Logger) (*enode.Node, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", n.Hostname())
+	if err != nil {
+		return nil, fmt.Errorf("DNS lookup failed for %q: %v", n.Hostname(), err)
 	}
-	// Otherwise, do a network lookup.
-	result := tab.Lookup(targetID)
-	for _, n := range result {
-		if n.ID == targetID {
-			return n
+
+	var ip4, ip6 netip.Addr
+	for _, ip := range ips {
+		if ip.Is4() && !ip4.IsValid() {
+			ip4 = ip
+		}
+		if ip.Is6() && !ip6.IsValid() {
+			ip6 = ip
 		}
 	}
-	return nil
+	if !ip4.IsValid() && !ip6.IsValid() {
+		return nil, fmt.Errorf("no IP addresses found for hostname %q", n.Hostname())
+	}
+
+	rec := n.Record()
+	if ip4.IsValid() {
+		rec.Set(enr.IPv4Addr(ip4))
+	}
+	if ip6.IsValid() {
+		rec.Set(enr.IPv6Addr(ip6))
+	}
+	rec.SetSeq(n.Seq())
+	resolved := enode.SignNull(rec, n.ID()).WithHostname(n.Hostname())
+	logger.Debug("Resolved bootstrap node hostname", "name", n.Hostname(), "ip", resolved.IP())
+	return resolved, nil
 }
 
-// Lookup performs a network search for nodes close
-// to the given target. It approaches the target by querying
-// nodes that are closer to it on each iteration.
-// The given target does not need to be an actual node
-// identifier.
-func (tab *Table) Lookup(targetID NodeID) []*Node {
-	return tab.lookup(targetID, true)
-}
-
-func (tab *Table) lookup(targetID NodeID, refreshIfEmpty bool) []*Node {
-	var (
-		target         = crypto.Keccak256Hash(targetID[:])
-		asked          = make(map[NodeID]bool)
-		seen           = make(map[NodeID]bool)
-		reply          = make(chan []*Node, alpha)
-		pendingQueries = 0
-		result         *nodesByDistance
-	)
-	// don't query further if we hit ourself.
-	// unlikely to happen often in practice.
-	asked[tab.self.ID] = true
-
-	for {
-		tab.mutex.Lock()
-		// generate initial result set
-		result = tab.closest(target, bucketSize)
-		tab.mutex.Unlock()
-		if len(result.entries) > 0 || !refreshIfEmpty {
-			break
-		}
-		// The result set is empty, all nodes were dropped, refresh.
-		// We actually wait for the refresh to complete here. The very
-		// first query will hit this case and run the bootstrapping
-		// logic.
-		<-tab.refresh()
-		refreshIfEmpty = false
+// isInitDone returns whether the table's initial seeding procedure has completed.
+func (tab *Table) isInitDone() bool {
+	select {
+	case <-tab.initDone:
+		return true
+	default:
+		return false
 	}
-
-	for {
-		// ask the alpha closest nodes that we haven't asked yet
-		for i := 0; i < len(result.entries) && pendingQueries < alpha; i++ {
-			n := result.entries[i]
-			if !asked[n.ID] {
-				asked[n.ID] = true
-				pendingQueries++
-				go func() {
-					// Find potential neighbors to bond with
-					r, err := tab.net.findnode(n.ID, n.addr(), targetID)
-					if err != nil {
-						// Bump the failure counter to detect and evacuate non-bonded entries
-						fails := tab.db.findFails(n.ID) + 1
-						tab.db.updateFindFails(n.ID, fails)
-						glog.V(logger.Detail).Infof("Bumping failures for %x: %d", n.ID[:8], fails)
-
-						if fails >= maxFindnodeFailures {
-							glog.V(logger.Detail).Infof("Evacuating node %x: %d findnode failures", n.ID[:8], fails)
-							tab.delete(n)
-						}
-					}
-					reply <- tab.bondall(r)
-				}()
-			}
-		}
-		if pendingQueries == 0 {
-			// we have asked all closest nodes, stop the search
-			break
-		}
-		// wait for the next reply
-		for _, n := range <-reply {
-			if n != nil && !seen[n.ID] {
-				seen[n.ID] = true
-				result.push(n, bucketSize)
-			}
-		}
-		pendingQueries--
-	}
-	return result.entries
 }
 
 func (tab *Table) refresh() <-chan struct{} {
 	done := make(chan struct{})
 	select {
 	case tab.refreshReq <- done:
-	case <-tab.closed:
+	case <-tab.closeReq:
 		close(done)
 	}
 	return done
 }
 
-// refreshLoop schedules doRefresh runs and coordinates shutdown.
-func (tab *Table) refreshLoop() {
+// findnodeByID returns the n nodes in the table that are closest to the given id.
+// This is used by the FINDNODE/v4 handler.
+//
+// The preferLive parameter says whether the caller wants liveness-checked results. If
+// preferLive is true and the table contains any verified nodes, the result will not
+// contain unverified nodes. However, if there are no verified nodes at all, the result
+// will contain unverified nodes.
+func (tab *Table) findnodeByID(target enode.ID, nresults int, preferLive bool) (nodes nodesByDistance) {
+	nodes.target = target
+	tab.mutex.Lock()
+	defer tab.mutex.Unlock()
+
+	// Scan all buckets. There might be a better way to do this, but there aren't that many
+	// buckets, so this solution should be fine. The worst-case complexity of this loop
+	// is O(tab.len() * nresults).
+	if preferLive {
+		for _, b := range &tab.buckets {
+			for _, n := range b.entries {
+				if n.isValidatedLive {
+					nodes.push(n.Node, nresults)
+				}
+			}
+		}
+		if len(nodes.entries) > 0 {
+			return
+		}
+	}
+
+	for _, b := range &tab.buckets {
+		for _, n := range b.entries {
+			nodes.push(n.Node, nresults)
+		}
+	}
+	return
+}
+
+// appendBucketNodes adds nodes at the given distance to the result slice.
+// This is used by the FINDNODE/v5 handler.
+func (tab *Table) appendBucketNodes(dist uint, result []*enode.Node, checkLive bool) []*enode.Node {
+	if dist > 256 {
+		return result
+	}
+	if dist == 0 {
+		return append(result, tab.self())
+	}
+
+	tab.mutex.Lock()
+	for _, n := range tab.bucketAtDistance(int(dist)).entries {
+		if !checkLive || n.isValidatedLive {
+			result = append(result, n.Node)
+		}
+	}
+	tab.mutex.Unlock()
+
+	// Shuffle result to avoid always returning same nodes in FINDNODE/v5.
+	tab.rand.Shuffle(len(result), func(i, j int) {
+		result[i], result[j] = result[j], result[i]
+	})
+	return result
+}
+
+// len returns the number of nodes in the table.
+func (tab *Table) len() (n int) {
+	tab.mutex.Lock()
+	defer tab.mutex.Unlock()
+
+	for _, b := range &tab.buckets {
+		n += len(b.entries)
+	}
+	return n
+}
+
+// addFoundNode adds a node which may not be live. If the bucket has space available,
+// adding the node succeeds immediately. Otherwise, the node is added to the replacements
+// list.
+//
+// The caller must not hold tab.mutex.
+func (tab *Table) addFoundNode(n *enode.Node, forceSetLive bool) bool {
+	op := addNodeOp{node: n, isInbound: false, forceSetLive: forceSetLive}
+	select {
+	case tab.addNodeCh <- op:
+		return <-tab.addNodeHandled
+	case <-tab.closeReq:
+		return false
+	}
+}
+
+// addInboundNode adds a node from an inbound contact. If the bucket has no space, the
+// node is added to the replacements list.
+//
+// There is an additional safety measure: if the table is still initializing the node is
+// not added. This prevents an attack where the table could be filled by just sending ping
+// repeatedly.
+//
+// The caller must not hold tab.mutex.
+func (tab *Table) addInboundNode(n *enode.Node) bool {
+	op := addNodeOp{node: n, isInbound: true}
+	select {
+	case tab.addNodeCh <- op:
+		return <-tab.addNodeHandled
+	case <-tab.closeReq:
+		return false
+	}
+}
+
+func (tab *Table) trackRequest(n *enode.Node, success bool, foundNodes []*enode.Node) {
+	op := trackRequestOp{n, foundNodes, success}
+	select {
+	case tab.trackRequestCh <- op:
+	case <-tab.closeReq:
+	}
+}
+
+// loop is the main loop of Table.
+func (tab *Table) loop() {
 	var (
-		timer   = time.NewTicker(autoRefreshInterval)
-		waiting []chan struct{} // accumulates waiting callers while doRefresh runs
-		done    chan struct{}   // where doRefresh reports completion
+		refresh         = time.NewTimer(tab.nextRefreshTime())
+		refreshDone     = make(chan struct{})           // where doRefresh reports completion
+		waiting         = []chan struct{}{tab.initDone} // holds waiting callers while doRefresh runs
+		revalTimer      = mclock.NewAlarm(tab.cfg.Clock)
+		reseedRandTimer = time.NewTicker(10 * time.Minute)
 	)
+	defer refresh.Stop()
+	defer revalTimer.Stop()
+	defer reseedRandTimer.Stop()
+
+	// Start initial refresh.
+	go tab.doRefresh(refreshDone)
+
 loop:
 	for {
+		nextTime := tab.revalidation.run(tab, tab.cfg.Clock.Now())
+		revalTimer.Schedule(nextTime)
+
 		select {
-		case <-timer.C:
-			if done == nil {
-				done = make(chan struct{})
-				go tab.doRefresh(done)
+		case <-reseedRandTimer.C:
+			tab.rand.seed()
+
+		case <-revalTimer.C():
+
+		case r := <-tab.revalResponseCh:
+			tab.revalidation.handleResponse(tab, r)
+
+		case op := <-tab.addNodeCh:
+			tab.mutex.Lock()
+			ok := tab.handleAddNode(op)
+			tab.mutex.Unlock()
+			tab.addNodeHandled <- ok
+
+		case op := <-tab.trackRequestCh:
+			tab.handleTrackRequest(op)
+
+		case <-refresh.C:
+			if refreshDone == nil {
+				refreshDone = make(chan struct{})
+				go tab.doRefresh(refreshDone)
 			}
+
 		case req := <-tab.refreshReq:
 			waiting = append(waiting, req)
-			if done == nil {
-				done = make(chan struct{})
-				go tab.doRefresh(done)
+			if refreshDone == nil {
+				refreshDone = make(chan struct{})
+				go tab.doRefresh(refreshDone)
 			}
-		case <-done:
+
+		case <-refreshDone:
 			for _, ch := range waiting {
 				close(ch)
 			}
-			waiting = nil
-			done = nil
+			waiting, refreshDone = nil, nil
+			refresh.Reset(tab.nextRefreshTime())
+
 		case <-tab.closeReq:
 			break loop
 		}
 	}
 
-	if tab.net != nil {
-		tab.net.close()
-	}
-	if done != nil {
-		<-done
+	if refreshDone != nil {
+		<-refreshDone
 	}
 	for _, ch := range waiting {
 		close(ch)
 	}
-	tab.db.close()
 	close(tab.closed)
 }
 
-// doRefresh performs a lookup for a random target to keep buckets
-// full. seed nodes are inserted if the table is empty (initial
-// bootstrap or discarded faulty peers).
+// doRefresh performs a lookup for a random target to keep buckets full. seed nodes are
+// inserted if the table is empty (initial bootstrap or discarded faulty peers).
 func (tab *Table) doRefresh(done chan struct{}) {
 	defer close(done)
+
+	// Load nodes from the database and insert
+	// them. This should yield a few previously seen nodes that are
+	// (hopefully) still alive.
+	tab.loadSeedNodes()
+
+	// Run self lookup to discover new neighbor nodes.
+	tab.net.lookupSelf()
 
 	// The Kademlia paper specifies that the bucket refresh should
 	// perform a lookup in the least recently used bucket. We cannot
 	// adhere to this because the findnode target is a 512bit value
 	// (not hash-sized) and it is not easily possible to generate a
 	// sha3 preimage that falls into a chosen bucket.
-	// We perform a lookup with a random target instead.
-	var target NodeID
-	rand.Read(target[:])
-	result := tab.lookup(target, false)
-	if len(result) > 0 {
-		return
+	// We perform a few lookups with a random target instead.
+	for i := 0; i < 3; i++ {
+		tab.net.lookupRandom()
 	}
-
-	// The table is empty. Load nodes from the database and insert
-	// them. This should yield a few previously seen nodes that are
-	// (hopefully) still alive.
-	seeds := tab.db.querySeeds(seedCount, seedMaxAge)
-	seeds = tab.bondall(append(seeds, tab.nursery...))
-	if glog.V(logger.Debug) {
-		if len(seeds) == 0 {
-			glog.Infof("no seed nodes found")
-		}
-		for _, n := range seeds {
-			age := time.Since(tab.db.lastPong(n.ID))
-			glog.Infof("seed node (age %v): %v", age, n)
-		}
-	}
-	tab.mutex.Lock()
-	tab.stuff(seeds)
-	tab.mutex.Unlock()
-
-	// Finally, do a self lookup to fill up the buckets.
-	tab.lookup(tab.self.ID, false)
 }
 
-// closest returns the n nodes in the table that are closest to the
-// given id. The caller must hold tab.mutex.
-func (tab *Table) closest(target common.Hash, nresults int) *nodesByDistance {
-	// This is a very wasteful way to find the closest nodes but
-	// obviously correct. I believe that tree-based buckets would make
-	// this easier to implement efficiently.
-	close := &nodesByDistance{target: target}
-	for _, b := range tab.buckets {
-		for _, n := range b.entries {
-			close.push(n, nresults)
+func (tab *Table) loadSeedNodes() {
+	seeds := tab.db.QuerySeeds(seedCount, seedMaxAge)
+	seeds = append(seeds, tab.nursery...)
+	for i := range seeds {
+		seed := seeds[i]
+		if tab.log.Enabled(context.Background(), log.LevelTrace) {
+			age := time.Since(tab.db.LastPongReceived(seed.ID(), seed.IPAddr()))
+			addr, _ := seed.UDPEndpoint()
+			tab.log.Trace("Found seed node in database", "id", seed.ID(), "addr", addr, "age", age)
 		}
-	}
-	return close
-}
-
-func (tab *Table) len() (n int) {
-	for _, b := range tab.buckets {
-		n += len(b.entries)
-	}
-	return n
-}
-
-// bondall bonds with all given nodes concurrently and returns
-// those nodes for which bonding has probably succeeded.
-func (tab *Table) bondall(nodes []*Node) (result []*Node) {
-	rc := make(chan *Node, len(nodes))
-	for i := range nodes {
-		go func(n *Node) {
-			nn, _ := tab.bond(false, n.ID, n.addr(), uint16(n.TCP))
-			rc <- nn
-		}(nodes[i])
-	}
-	for _ = range nodes {
-		if n := <-rc; n != nil {
-			result = append(result, n)
-		}
-	}
-	return result
-}
-
-// bond ensures the local node has a bond with the given remote node.
-// It also attempts to insert the node into the table if bonding succeeds.
-// The caller must not hold tab.mutex.
-//
-// A bond is must be established before sending findnode requests.
-// Both sides must have completed a ping/pong exchange for a bond to
-// exist. The total number of active bonding processes is limited in
-// order to restrain network use.
-//
-// bond is meant to operate idempotently in that bonding with a remote
-// node which still remembers a previously established bond will work.
-// The remote node will simply not send a ping back, causing waitping
-// to time out.
-//
-// If pinged is true, the remote node has just pinged us and one half
-// of the process can be skipped.
-func (tab *Table) bond(pinged bool, id NodeID, addr *net.UDPAddr, tcpPort uint16) (*Node, error) {
-	if id == tab.self.ID {
-		return nil, errors.New("is self")
-	}
-	// Retrieve a previously known node and any recent findnode failures
-	node, fails := tab.db.node(id), 0
-	if node != nil {
-		fails = tab.db.findFails(id)
-	}
-	// If the node is unknown (non-bonded) or failed (remotely unknown), bond from scratch
-	var result error
-	age := time.Since(tab.db.lastPong(id))
-	if node == nil || fails > 0 || age > nodeDBNodeExpiration {
-		glog.V(logger.Detail).Infof("Bonding %x: known=%t, fails=%d age=%v", id[:8], node != nil, fails, age)
-
-		tab.bondmu.Lock()
-		w := tab.bonding[id]
-		if w != nil {
-			// Wait for an existing bonding process to complete.
-			tab.bondmu.Unlock()
-			<-w.done
-		} else {
-			// Register a new bonding process.
-			w = &bondproc{done: make(chan struct{})}
-			tab.bonding[id] = w
-			tab.bondmu.Unlock()
-			// Do the ping/pong. The result goes into w.
-			tab.pingpong(w, pinged, id, addr, tcpPort)
-			// Unregister the process after it's done.
-			tab.bondmu.Lock()
-			delete(tab.bonding, id)
-			tab.bondmu.Unlock()
-		}
-		// Retrieve the bonding results
-		result = w.err
-		if result == nil {
-			node = w.n
-		}
-	}
-	if node != nil {
-		// Add the node to the table even if the bonding ping/pong
-		// fails. It will be relaced quickly if it continues to be
-		// unresponsive.
-		tab.add(node)
-		tab.db.updateFindFails(id, 0)
-	}
-	return node, result
-}
-
-func (tab *Table) pingpong(w *bondproc, pinged bool, id NodeID, addr *net.UDPAddr, tcpPort uint16) {
-	// Request a bonding slot to limit network usage
-	<-tab.bondslots
-	defer func() { tab.bondslots <- struct{}{} }()
-
-	// Ping the remote side and wait for a pong.
-	if w.err = tab.ping(id, addr); w.err != nil {
-		close(w.done)
-		return
-	}
-	if !pinged {
-		// Give the remote node a chance to ping us before we start
-		// sending findnode requests. If they still remember us,
-		// waitping will simply time out.
-		tab.net.waitping(id)
-	}
-	// Bonding succeeded, update the node database.
-	w.n = NewNode(id, addr.IP, uint16(addr.Port), tcpPort)
-	tab.db.updateNode(w.n)
-	close(w.done)
-}
-
-// ping a remote endpoint and wait for a reply, also updating the node
-// database accordingly.
-func (tab *Table) ping(id NodeID, addr *net.UDPAddr) error {
-	tab.db.updateLastPing(id, time.Now())
-	if err := tab.net.ping(id, addr); err != nil {
-		return err
-	}
-	tab.db.updateLastPong(id, time.Now())
-
-	// Start the background expiration goroutine after the first
-	// successful communication. Subsequent calls have no effect if it
-	// is already running. We do this here instead of somewhere else
-	// so that the search for seed nodes also considers older nodes
-	// that would otherwise be removed by the expiration.
-	tab.db.ensureExpirer()
-	return nil
-}
-
-// add attempts to add the given node its corresponding bucket. If the
-// bucket has space available, adding the node succeeds immediately.
-// Otherwise, the node is added if the least recently active node in
-// the bucket does not respond to a ping packet.
-//
-// The caller must not hold tab.mutex.
-func (tab *Table) add(new *Node) {
-	b := tab.buckets[logdist(tab.self.sha, new.sha)]
-	tab.mutex.Lock()
-	defer tab.mutex.Unlock()
-	if b.bump(new) {
-		return
-	}
-	var oldest *Node
-	if len(b.entries) == bucketSize {
-		oldest = b.entries[bucketSize-1]
-		if oldest.contested {
-			// The node is already being replaced, don't attempt
-			// to replace it.
-			return
-		}
-		oldest.contested = true
-		// Let go of the mutex so other goroutines can access
-		// the table while we ping the least recently active node.
-		tab.mutex.Unlock()
-		err := tab.ping(oldest.ID, oldest.addr())
 		tab.mutex.Lock()
-		oldest.contested = false
-		if err == nil {
-			// The node responded, don't replace it.
-			return
-		}
-	}
-	added := b.replace(new, oldest)
-	if added && tab.nodeAddedHook != nil {
-		tab.nodeAddedHook(new)
+		tab.handleAddNode(addNodeOp{node: seed, isInbound: false})
+		tab.mutex.Unlock()
 	}
 }
 
-// stuff adds nodes the table to the end of their corresponding bucket
-// if the bucket is not full. The caller must hold tab.mutex.
-func (tab *Table) stuff(nodes []*Node) {
-outer:
-	for _, n := range nodes {
-		if n.ID == tab.self.ID {
-			continue // don't add self
-		}
-		bucket := tab.buckets[logdist(tab.self.sha, n.sha)]
-		for i := range bucket.entries {
-			if bucket.entries[i].ID == n.ID {
-				continue outer // already in bucket
-			}
-		}
-		if len(bucket.entries) < bucketSize {
-			bucket.entries = append(bucket.entries, n)
-			if tab.nodeAddedHook != nil {
-				tab.nodeAddedHook(n)
-			}
-		}
-	}
+func (tab *Table) nextRefreshTime() time.Duration {
+	half := tab.cfg.RefreshInterval / 2
+	return half + time.Duration(tab.rand.Int63n(int64(half)))
 }
 
-// delete removes an entry from the node table (used to evacuate
-// failed/non-bonded discovery peers).
-func (tab *Table) delete(node *Node) {
-	tab.mutex.Lock()
-	defer tab.mutex.Unlock()
-	bucket := tab.buckets[logdist(tab.self.sha, node.sha)]
-	for i := range bucket.entries {
-		if bucket.entries[i].ID == node.ID {
-			bucket.entries = append(bucket.entries[:i], bucket.entries[i+1:]...)
-			return
-		}
-	}
+// bucket returns the bucket for the given node ID hash.
+func (tab *Table) bucket(id enode.ID) *bucket {
+	d := enode.LogDist(tab.self().ID(), id)
+	return tab.bucketAtDistance(d)
 }
 
-func (b *bucket) replace(n *Node, last *Node) bool {
-	// Don't add if b already contains n.
-	for i := range b.entries {
-		if b.entries[i].ID == n.ID {
-			return false
-		}
+func (tab *Table) bucketAtDistance(d int) *bucket {
+	if d <= bucketMinDistance {
+		return tab.buckets[0]
 	}
-	// Replace last if it is still the last entry or just add n if b
-	// isn't full. If is no longer the last entry, it has either been
-	// replaced with someone else or became active.
-	if len(b.entries) == bucketSize && (last == nil || b.entries[bucketSize-1].ID != last.ID) {
+	return tab.buckets[d-bucketMinDistance-1]
+}
+
+func (tab *Table) addIP(b *bucket, ip netip.Addr) bool {
+	if !ip.IsValid() || ip.IsUnspecified() {
+		return false // Nodes without IP cannot be added.
+	}
+	if netutil.AddrIsLAN(ip) {
+		return true
+	}
+	if !tab.ips.AddAddr(ip) {
+		tab.log.Debug("IP exceeds table limit", "ip", ip)
 		return false
 	}
-	if len(b.entries) < bucketSize {
-		b.entries = append(b.entries, nil)
+	if !b.ips.AddAddr(ip) {
+		tab.log.Debug("IP exceeds bucket limit", "ip", ip)
+		tab.ips.RemoveAddr(ip)
+		return false
 	}
-	copy(b.entries[1:], b.entries)
-	b.entries[0] = n
 	return true
 }
 
-func (b *bucket) bump(n *Node) bool {
-	for i := range b.entries {
-		if b.entries[i].ID == n.ID {
-			// move it to the front
-			copy(b.entries[1:], b.entries[:i])
-			b.entries[0] = n
-			return true
+func (tab *Table) removeIP(b *bucket, ip netip.Addr) {
+	if netutil.AddrIsLAN(ip) {
+		return
+	}
+	tab.ips.RemoveAddr(ip)
+	b.ips.RemoveAddr(ip)
+}
+
+// handleAddNode adds the node in the request to the table, if there is space.
+// The caller must hold tab.mutex.
+func (tab *Table) handleAddNode(req addNodeOp) bool {
+	if req.node.ID() == tab.self().ID() {
+		return false
+	}
+	// For nodes from inbound contact, there is an additional safety measure: if the table
+	// is still initializing the node is not added.
+	if req.isInbound && !tab.isInitDone() {
+		return false
+	}
+
+	b := tab.bucket(req.node.ID())
+	n, _ := tab.bumpInBucket(b, req.node, req.isInbound)
+	if n != nil {
+		// Already in bucket.
+		return false
+	}
+	if len(b.entries) >= bucketSize {
+		// Bucket full, maybe add as replacement.
+		tab.addReplacement(b, req.node)
+		return false
+	}
+	if !tab.addIP(b, req.node.IPAddr()) {
+		// Can't add: IP limit reached.
+		return false
+	}
+
+	// Add to bucket.
+	wn := &tableNode{Node: req.node}
+	if req.forceSetLive {
+		wn.livenessChecks = 1
+		wn.isValidatedLive = true
+	}
+	b.entries = append(b.entries, wn)
+	b.replacements = deleteNode(b.replacements, wn.ID())
+	tab.nodeAdded(b, wn)
+	return true
+}
+
+// addReplacement adds n to the replacement cache of bucket b.
+func (tab *Table) addReplacement(b *bucket, n *enode.Node) {
+	if containsID(b.replacements, n.ID()) {
+		// TODO: update ENR
+		return
+	}
+	if !tab.addIP(b, n.IPAddr()) {
+		return
+	}
+
+	wn := &tableNode{Node: n, addedToTable: time.Now()}
+	var removed *tableNode
+	b.replacements, removed = pushNode(b.replacements, wn, maxReplacements)
+	if removed != nil {
+		tab.removeIP(b, removed.IPAddr())
+	}
+}
+
+func (tab *Table) nodeAdded(b *bucket, n *tableNode) {
+	if n.addedToTable.IsZero() {
+		n.addedToTable = time.Now()
+	}
+	n.addedToBucket = time.Now()
+	tab.revalidation.nodeAdded(tab, n)
+
+	tab.nodeFeed.Send(n.Node)
+	if tab.nodeAddedHook != nil {
+		tab.nodeAddedHook(b, n)
+	}
+	if metrics.Enabled() {
+		bucketsCounter[b.index].Inc(1)
+	}
+}
+
+func (tab *Table) nodeRemoved(b *bucket, n *tableNode) {
+	tab.revalidation.nodeRemoved(n)
+	if tab.nodeRemovedHook != nil {
+		tab.nodeRemovedHook(b, n)
+	}
+	if metrics.Enabled() {
+		bucketsCounter[b.index].Dec(1)
+	}
+}
+
+// deleteInBucket removes node n from the table.
+// If there are replacement nodes in the bucket, the node is replaced.
+func (tab *Table) deleteInBucket(b *bucket, id enode.ID) *tableNode {
+	index := slices.IndexFunc(b.entries, func(e *tableNode) bool { return e.ID() == id })
+	if index == -1 {
+		// Entry has been removed already.
+		return nil
+	}
+
+	// Remove the node.
+	n := b.entries[index]
+	b.entries = slices.Delete(b.entries, index, index+1)
+	tab.removeIP(b, n.IPAddr())
+	tab.nodeRemoved(b, n)
+
+	// Add replacement.
+	if len(b.replacements) == 0 {
+		tab.log.Debug("Removed dead node", "b", b.index, "id", n.ID(), "ip", n.IPAddr())
+		return nil
+	}
+	rindex := tab.rand.Intn(len(b.replacements))
+	rep := b.replacements[rindex]
+	b.replacements = slices.Delete(b.replacements, rindex, rindex+1)
+	b.entries = append(b.entries, rep)
+	tab.nodeAdded(b, rep)
+	tab.log.Debug("Replaced dead node", "b", b.index, "id", n.ID(), "ip", n.IPAddr(), "r", rep.ID(), "rip", rep.IPAddr())
+	return rep
+}
+
+// bumpInBucket updates a node record if it exists in the bucket.
+// The second return value reports whether the node's endpoint (IP/port) was updated.
+func (tab *Table) bumpInBucket(b *bucket, newRecord *enode.Node, isInbound bool) (n *tableNode, endpointChanged bool) {
+	i := slices.IndexFunc(b.entries, func(elem *tableNode) bool {
+		return elem.ID() == newRecord.ID()
+	})
+	if i == -1 {
+		return nil, false // not in bucket
+	}
+	n = b.entries[i]
+
+	// For inbound updates (from the node itself) we accept any change, even if it sets
+	// back the sequence number. For found nodes (!isInbound), seq has to advance. Note
+	// this check also ensures found discv4 nodes (which always have seq=0) can't be
+	// updated.
+	if newRecord.Seq() <= n.Seq() && !isInbound {
+		return n, false
+	}
+
+	// Check endpoint update against IP limits.
+	ipchanged := newRecord.IPAddr() != n.IPAddr()
+	portchanged := newRecord.UDP() != n.UDP()
+	if ipchanged {
+		tab.removeIP(b, n.IPAddr())
+		if !tab.addIP(b, newRecord.IPAddr()) {
+			// It doesn't fit with the limit, put the previous record back.
+			tab.addIP(b, n.IPAddr())
+			return n, false
 		}
 	}
-	return false
-}
 
-// nodesByDistance is a list of nodes, ordered by
-// distance to target.
-type nodesByDistance struct {
-	entries []*Node
-	target  common.Hash
-}
-
-// push adds the given node to the list, keeping the total size below maxElems.
-func (h *nodesByDistance) push(n *Node, maxElems int) {
-	ix := sort.Search(len(h.entries), func(i int) bool {
-		return distcmp(h.target, h.entries[i].sha, n.sha) > 0
-	})
-	if len(h.entries) < maxElems {
-		h.entries = append(h.entries, n)
+	// Apply update.
+	n.Node = newRecord
+	if ipchanged || portchanged {
+		// Ensure node is revalidated quickly for endpoint changes.
+		tab.revalidation.nodeEndpointChanged(tab, n)
+		return n, true
 	}
-	if ix == len(h.entries) {
-		// farther away than all nodes we already have.
-		// if there was room for it, the node is now the last element.
+	return n, false
+}
+
+func (tab *Table) handleTrackRequest(op trackRequestOp) {
+	var fails int
+	if op.success {
+		// Reset failure counter because it counts _consecutive_ failures.
+		tab.db.UpdateFindFails(op.node.ID(), op.node.IPAddr(), 0)
 	} else {
-		// slide existing entries down to make room
-		// this will overwrite the entry we just appended.
-		copy(h.entries[ix+1:], h.entries[ix:])
-		h.entries[ix] = n
+		fails = tab.db.FindFails(op.node.ID(), op.node.IPAddr())
+		fails++
+		tab.db.UpdateFindFails(op.node.ID(), op.node.IPAddr(), fails)
 	}
+
+	tab.mutex.Lock()
+	defer tab.mutex.Unlock()
+
+	b := tab.bucket(op.node.ID())
+	// Remove the node from the local table if it fails to return anything useful too
+	// many times, but only if there are enough other nodes in the bucket. This latter
+	// condition specifically exists to make bootstrapping in smaller test networks more
+	// reliable.
+	if fails >= maxFindnodeFailures && len(b.entries) >= bucketSize/4 {
+		tab.deleteInBucket(b, op.node.ID())
+	}
+
+	// Add found nodes.
+	for _, n := range op.foundNodes {
+		tab.handleAddNode(addNodeOp{n, false, false})
+	}
+}
+
+// pushNode adds n to the front of list, keeping at most max items.
+func pushNode(list []*tableNode, n *tableNode, max int) ([]*tableNode, *tableNode) {
+	if len(list) < max {
+		list = append(list, nil)
+	}
+	removed := list[len(list)-1]
+	copy(list[1:], list)
+	list[0] = n
+	return list, removed
+}
+
+// deleteNode removes a node from the table.
+func (tab *Table) deleteNode(n *enode.Node) {
+	tab.mutex.Lock()
+	defer tab.mutex.Unlock()
+	b := tab.bucket(n.ID())
+	tab.deleteInBucket(b, n.ID())
+}
+
+// waitForNodes blocks until the table contains at least n nodes.
+func (tab *Table) waitForNodes(ctx context.Context, n int) error {
+	// Wrap ctx so the forwarder goroutine exits when waitForNodes returns,
+	// regardless of whether the caller's ctx is canceled.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Set up a notification channel that gets unblocked when there was any activity on
+	// the table. Ultimately this reads from the table's nodeFeed, but can't use the feed
+	// directly on the same goroutine that takes Table.mutex, it would deadlock.
+	var notify chan struct{}
+	var notifyErr error
+	initsub := func() event.Subscription {
+		notify = make(chan struct{}, 1)
+		newnode := make(chan *enode.Node, 1)
+		sub := tab.nodeFeed.Subscribe(newnode)
+		go func() {
+			defer close(notify)
+			for {
+				select {
+				case <-newnode:
+					select {
+					case notify <- struct{}{}:
+					default:
+					}
+				case <-ctx.Done():
+					notifyErr = ctx.Err()
+					return
+				case <-tab.closeReq:
+					notifyErr = errClosed
+					return
+				}
+			}
+		}()
+		return sub
+	}
+
+	getlength := func() (count int) {
+		for _, b := range &tab.buckets {
+			count += len(b.entries)
+		}
+		return count
+	}
+
+	for {
+		tab.mutex.Lock()
+		if getlength() >= n {
+			tab.mutex.Unlock()
+			return nil
+		}
+		if notify == nil {
+			// Lazily init the subscription. Do this while holding the
+			// lock so we don't miss any events that change the node count.
+			sub := initsub()
+			defer sub.Unsubscribe()
+		}
+		tab.mutex.Unlock()
+
+		// Wait for table event.
+		if _, ok := <-notify; !ok {
+			break
+		}
+	}
+	return notifyErr
 }

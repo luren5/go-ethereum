@@ -17,89 +17,105 @@
 package vm
 
 import (
-	"math/big"
-
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/holiman/uint256"
 )
 
-// ContractRef is a reference to the contract's backing object
-type ContractRef interface {
-	ReturnGas(*big.Int, *big.Int)
-	Address() common.Address
-	Value() *big.Int
-	SetCode(common.Hash, []byte)
-	ForEachStorage(callback func(key, value common.Hash) bool)
-}
-
 // Contract represents an ethereum contract in the state database. It contains
-// the the contract code, calling arguments. Contract implements ContractRef
+// the contract code, calling arguments. Contract implements ContractRef
 type Contract struct {
-	// CallerAddress is the result of the caller which initialised this
-	// contract. However when the "call method" is delegated this value
-	// needs to be initialised to that of the caller's caller.
-	CallerAddress common.Address
-	caller        ContractRef
-	self          ContractRef
+	// caller is the result of the caller which initialised this
+	// contract. However, when the "call method" is delegated this
+	// value needs to be initialised to that of the caller's caller.
+	caller  common.Address
+	address common.Address
 
-	jumpdests destinations // result of JUMPDEST analysis.
+	jumpDests JumpDestCache // Aggregated result of JUMPDEST analysis.
+	analysis  BitVec        // Locally cached result of JUMPDEST analysis
 
 	Code     []byte
 	CodeHash common.Hash
-	CodeAddr *common.Address
 	Input    []byte
 
-	value, Gas, UsedGas, Price *big.Int
+	// is the execution frame represented by this object a contract deployment
+	IsDeployment bool
+	IsSystemCall bool
 
-	Args []byte
-
-	DelegateCall bool
+	// Gas carries the unified gas state for this frame: running balance,
+	// reservoir, and per-frame usage accumulators. See GasBudget.
+	Gas   GasBudget
+	value *uint256.Int
 }
 
 // NewContract returns a new contract environment for the execution of EVM.
-func NewContract(caller ContractRef, object ContractRef, value, gas, price *big.Int) *Contract {
-	c := &Contract{CallerAddress: caller.Address(), caller: caller, self: object, Args: nil}
-
-	if parent, ok := caller.(*Contract); ok {
-		// Reuse JUMPDEST analysis from parent context if available.
-		c.jumpdests = parent.jumpdests
-	} else {
-		c.jumpdests = make(destinations)
+func NewContract(caller common.Address, address common.Address, value *uint256.Int, gas GasBudget, jumpDests JumpDestCache) *Contract {
+	// Initialize the jump analysis cache if it's nil, mostly for tests
+	if jumpDests == nil {
+		jumpDests = newMapJumpDests()
 	}
-
-	// Gas should be a pointer so it can safely be reduced through the run
-	// This pointer will be off the state transition
-	c.Gas = gas //new(big.Int).Set(gas)
-	c.value = new(big.Int).Set(value)
-	// In most cases price and value are pointers to transaction objects
-	// and we don't want the transaction's values to change.
-	c.Price = new(big.Int).Set(price)
-	c.UsedGas = new(big.Int)
-
-	return c
+	return &Contract{
+		caller:    caller,
+		address:   address,
+		jumpDests: jumpDests,
+		Gas:       gas,
+		value:     value,
+	}
 }
 
-// AsDelegate sets the contract to be a delegate call and returns the current
-// contract (for chaining calls)
-func (c *Contract) AsDelegate() *Contract {
-	c.DelegateCall = true
-	// NOTE: caller must, at all times be a contract. It should never happen
-	// that caller is something other than a Contract.
-	c.CallerAddress = c.caller.(*Contract).CallerAddress
-	return c
+func (c *Contract) validJumpdest(dest *uint256.Int) bool {
+	udest, overflow := dest.Uint64WithOverflow()
+	// PC cannot go beyond len(code) and certainly can't be bigger than 63bits.
+	// Don't bother checking for JUMPDEST in that case.
+	if overflow || udest >= uint64(len(c.Code)) {
+		return false
+	}
+	// Only JUMPDESTs allowed for destinations
+	if OpCode(c.Code[udest]) != JUMPDEST {
+		return false
+	}
+	return c.isCode(udest)
+}
+
+// isCode returns true if the provided PC location is an actual opcode, as
+// opposed to a data-segment following a PUSHN operation.
+func (c *Contract) isCode(udest uint64) bool {
+	// Do we already have an analysis laying around?
+	if c.analysis != nil {
+		return c.analysis.codeSegment(udest)
+	}
+	// Do we have a contract hash already?
+	// If we do have a hash, that means it's a 'regular' contract. For regular
+	// contracts ( not temporary initcode), we store the analysis in a map
+	if c.CodeHash != (common.Hash{}) {
+		// Does parent context have the analysis?
+		analysis, exist := c.jumpDests.Load(c.CodeHash)
+		if !exist {
+			// Do the analysis and save in parent context
+			// We do not need to store it in c.analysis
+			analysis = codeBitmap(c.Code)
+			c.jumpDests.Store(c.CodeHash, analysis)
+		}
+		// Also stash it in current contract for faster access
+		c.analysis = analysis
+		return analysis.codeSegment(udest)
+	}
+	// We don't have the code hash, most likely a piece of initcode not already
+	// in state trie. In that case, we do an analysis, and save it locally, so
+	// we don't have to recalculate it for every JUMP instruction in the execution
+	// However, we don't save it within the parent context
+	if c.analysis == nil {
+		c.analysis = codeBitmap(c.Code)
+	}
+	return c.analysis.codeSegment(udest)
 }
 
 // GetOp returns the n'th element in the contract's byte array
 func (c *Contract) GetOp(n uint64) OpCode {
-	return OpCode(c.GetByte(n))
-}
-
-// GetByte returns the n'th byte in the contract's byte array
-func (c *Contract) GetByte(n uint64) byte {
 	if n < uint64(len(c.Code)) {
-		return c.Code[n]
+		return OpCode(c.Code[n])
 	}
-
-	return 0
+	return STOP
 }
 
 // Caller returns the caller of the contract.
@@ -107,58 +123,80 @@ func (c *Contract) GetByte(n uint64) byte {
 // Caller will recursively call caller when the contract is a delegate
 // call, including that of caller's caller.
 func (c *Contract) Caller() common.Address {
-	return c.CallerAddress
+	return c.caller
 }
 
-// Finalise finalises the contract and returning any remaining gas to the original
-// caller.
-func (c *Contract) Finalise() {
-	// Return the remaining gas to the caller
-	c.caller.ReturnGas(c.Gas, c.Price)
-}
-
-// UseGas attempts the use gas and subtracts it and returns true on success
-func (c *Contract) UseGas(gas *big.Int) (ok bool) {
-	ok = useGas(c.Gas, gas)
-	if ok {
-		c.UsedGas.Add(c.UsedGas, gas)
+// chargeExecution deducts execution gas only, with tracer integration.
+// Returns false on OOG. Delegates the arithmetic to GasBudget.ChargeExecution.
+func (c *Contract) chargeExecution(r uint64, logger *tracing.Hooks, reason tracing.GasChangeReason) bool {
+	prior, ok := c.Gas.ChargeExecution(r)
+	if !ok {
+		return false
 	}
-	return
+	if logger.HasGasHook() && reason != tracing.GasChangeIgnored {
+		logger.EmitGasChange(prior.AsTracing(), c.Gas.AsTracing(), reason)
+	}
+	return true
 }
 
-// ReturnGas adds the given gas back to itself.
-func (c *Contract) ReturnGas(gas, price *big.Int) {
-	// Return the gas to the context
-	c.Gas.Add(c.Gas, gas)
-	c.UsedGas.Sub(c.UsedGas, gas)
+// chargeState deducts state gas (spilling into execution when the reservoir is
+// exhausted), with tracer integration. Returns false on OOG.
+func (c *Contract) chargeState(s uint64, logger *tracing.Hooks, reason tracing.GasChangeReason) bool {
+	prior, ok := c.Gas.ChargeState(s)
+	if !ok {
+		return false
+	}
+	if logger.HasGasHook() && reason != tracing.GasChangeIgnored {
+		logger.EmitGasChange(prior.AsTracing(), c.Gas.AsTracing(), reason)
+	}
+	return true
+}
+
+// refundState refunds the pre-charged state gas back to state reservoir.
+func (c *Contract) refundState(s uint64, logger *tracing.Hooks, reason tracing.GasChangeReason) {
+	prior := c.Gas
+	c.Gas.RefundState(s)
+
+	if s != 0 && logger.HasGasHook() && reason != tracing.GasChangeIgnored {
+		logger.EmitGasChange(prior.AsTracing(), c.Gas.AsTracing(), reason)
+	}
+}
+
+// refundGas absorbs a sub-call's leftover GasBudget into this contract's gas state.
+func (c *Contract) refundGas(child GasBudget, logger *tracing.Hooks) {
+	c.Gas.Absorb(child, logger)
+}
+
+// forwardGas drains `execution` gas and the entire state reservoir
+// from this contract's running budget and returns the initial GasBudget for
+// a child frame. The caller's UsedExecutionGas is bumped by the forwarded
+// amount so that the absorb-on-return path correctly reclaims the unused
+// portion. Thin wrapper around GasBudget.Forward with tracer integration.
+//
+// Caller must ensure `execution` is no larger than the running balance (the
+// opcode's dynamic gas table is expected to validate that before invoking
+// the opcode handler).
+func (c *Contract) forwardGas(execution uint64, logger *tracing.Hooks, reason tracing.GasChangeReason) GasBudget {
+	prior := c.Gas
+	child := c.Gas.Forward(execution)
+	if logger.HasGasHook() && reason != tracing.GasChangeIgnored {
+		logger.EmitGasChange(prior.AsTracing(), c.Gas.AsTracing(), reason)
+	}
+	return child
 }
 
 // Address returns the contracts address
 func (c *Contract) Address() common.Address {
-	return c.self.Address()
+	return c.address
 }
 
-// Value returns the contracts value (sent to it from it's caller)
-func (c *Contract) Value() *big.Int {
+// Value returns the contract's value (sent to it from it's caller)
+func (c *Contract) Value() *uint256.Int {
 	return c.value
 }
 
-// SetCode sets the code to the contract
-func (self *Contract) SetCode(hash common.Hash, code []byte) {
-	self.Code = code
-	self.CodeHash = hash
-}
-
-// SetCallCode sets the code of the contract and address of the backing data
-// object
-func (self *Contract) SetCallCode(addr *common.Address, hash common.Hash, code []byte) {
-	self.Code = code
-	self.CodeHash = hash
-	self.CodeAddr = addr
-}
-
-// EachStorage iterates the contract's storage and calls a method for every key
-// value pair.
-func (self *Contract) ForEachStorage(cb func(key, value common.Hash) bool) {
-	self.caller.ForEachStorage(cb)
+// SetCallCode sets the code of the contract,
+func (c *Contract) SetCallCode(hash common.Hash, code []byte) {
+	c.Code = code
+	c.CodeHash = hash
 }

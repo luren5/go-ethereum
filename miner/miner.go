@@ -18,175 +18,177 @@
 package miner
 
 import (
+	"context"
 	"fmt"
 	"math/big"
-	"sync/atomic"
+	"sync"
+	"time"
 
-	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/eth/downloader"
-	"github.com/ethereum/go-ethereum/ethdb"
-	"github.com/ethereum/go-ethereum/event"
-	"github.com/ethereum/go-ethereum/logger"
-	"github.com/ethereum/go-ethereum/logger/glog"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/ethereum/go-ethereum/pow"
 )
 
-// Backend wraps all methods required for mining.
+// Backend wraps all methods required for mining. Only full node is capable
+// to offer all the functions here.
 type Backend interface {
-	AccountManager() *accounts.Manager
 	BlockChain() *core.BlockChain
-	TxPool() *core.TxPool
-	ChainDb() ethdb.Database
+	TxPool() *txpool.TxPool
 }
 
-// Miner creates blocks and searches for proof-of-work values.
+// Config is the configuration parameters of mining.
+type Config struct {
+	Etherbase           common.Address `toml:"-"`          // Deprecated
+	PendingFeeRecipient common.Address `toml:"-"`          // Address for pending block rewards.
+	ExtraData           hexutil.Bytes  `toml:",omitempty"` // Block extra data set by the miner
+	GasCeil             uint64         // Target gas ceiling for mined blocks.
+	GasPrice            *big.Int       // Minimum gas price for mining a transaction
+	Recommit            time.Duration  // The time interval for miner to re-create mining work.
+	MaxBlobsPerBlock    int            // Maximum number of blobs per block (0 for unset uses protocol default)
+}
+
+// DefaultConfig contains default settings for miner.
+var DefaultConfig = Config{
+	GasCeil:  60_000_000,
+	GasPrice: big.NewInt(params.GWei / 1000),
+
+	// The default recommit time is chosen as two seconds since
+	// consensus-layer usually will wait a half slot of time(6s)
+	// for payload generation. It should be enough for Geth to
+	// run 3 rounds.
+	Recommit: 2 * time.Second,
+}
+
+// Miner is the main object which takes care of submitting new work to consensus
+// engine and gathering the sealing result.
 type Miner struct {
-	mux *event.TypeMux
-
-	worker *worker
-
-	MinAcceptedGasPrice *big.Int
-
-	threads  int
-	coinbase common.Address
-	mining   int32
-	eth      Backend
-	pow      pow.PoW
-
-	canStart    int32 // can start indicates whether we can start the mining operation
-	shouldStart int32 // should start indicates whether we should start after sync
+	confMu      sync.RWMutex // The lock used to protect the config fields: GasCeil, GasTip and Extradata
+	config      *Config
+	chainConfig *params.ChainConfig
+	engine      consensus.Engine
+	txpool      *txpool.TxPool
+	prio        []common.Address // A list of senders to prioritize
+	chain       *core.BlockChain
+	pending     *pending
+	pendingMu   sync.Mutex // Lock protects the pending block
 }
 
-func New(eth Backend, config *params.ChainConfig, mux *event.TypeMux, pow pow.PoW) *Miner {
-	miner := &Miner{
-		eth:      eth,
-		mux:      mux,
-		pow:      pow,
-		worker:   newWorker(config, common.Address{}, eth, mux),
-		canStart: 1,
-	}
-	go miner.update()
-
-	return miner
-}
-
-// update keeps track of the downloader events. Please be aware that this is a one shot type of update loop.
-// It's entered once and as soon as `Done` or `Failed` has been broadcasted the events are unregistered and
-// the loop is exited. This to prevent a major security vuln where external parties can DOS you with blocks
-// and halt your mining operation for as long as the DOS continues.
-func (self *Miner) update() {
-	events := self.mux.Subscribe(downloader.StartEvent{}, downloader.DoneEvent{}, downloader.FailedEvent{})
-out:
-	for ev := range events.Chan() {
-		switch ev.Data.(type) {
-		case downloader.StartEvent:
-			atomic.StoreInt32(&self.canStart, 0)
-			if self.Mining() {
-				self.Stop()
-				atomic.StoreInt32(&self.shouldStart, 1)
-				glog.V(logger.Info).Infoln("Mining operation aborted due to sync operation")
-			}
-		case downloader.DoneEvent, downloader.FailedEvent:
-			shouldStart := atomic.LoadInt32(&self.shouldStart) == 1
-
-			atomic.StoreInt32(&self.canStart, 1)
-			atomic.StoreInt32(&self.shouldStart, 0)
-			if shouldStart {
-				self.Start(self.coinbase, self.threads)
-			}
-			// unsubscribe. we're only interested in this event once
-			events.Unsubscribe()
-			// stop immediately and ignore all further pending events
-			break out
-		}
+// New creates a new miner with provided config.
+func New(eth Backend, config Config, engine consensus.Engine) *Miner {
+	return &Miner{
+		config:      &config,
+		chainConfig: eth.BlockChain().Config(),
+		engine:      engine,
+		txpool:      eth.TxPool(),
+		chain:       eth.BlockChain(),
+		pending:     &pending{},
 	}
 }
 
-func (m *Miner) SetGasPrice(price *big.Int) {
-	// FIXME block tests set a nil gas price. Quick dirty fix
-	if price == nil {
-		return
+// Pending returns the currently pending block and associated receipts, logs
+// and statedb. The returned values can be nil in case the pending block is
+// not initialized.
+func (miner *Miner) Pending() (*types.Block, types.Receipts, *state.StateDB) {
+	pending := miner.getPending()
+	if pending == nil {
+		return nil, nil, nil
 	}
-
-	m.worker.setGasPrice(price)
+	return pending.block, pending.receipts, pending.stateDB.Copy()
 }
 
-func (self *Miner) Start(coinbase common.Address, threads int) {
-	atomic.StoreInt32(&self.shouldStart, 1)
-	self.threads = threads
-	self.worker.coinbase = coinbase
-	self.coinbase = coinbase
-
-	if atomic.LoadInt32(&self.canStart) == 0 {
-		glog.V(logger.Info).Infoln("Can not start mining operation due to network sync (starts when finished)")
-		return
+// SetExtra sets the content used to initialize the block extra field.
+func (miner *Miner) SetExtra(extra []byte) error {
+	if uint64(len(extra)) > params.MaximumExtraDataSize {
+		return fmt.Errorf("extra exceeds max length. %d > %v", len(extra), params.MaximumExtraDataSize)
 	}
-
-	atomic.StoreInt32(&self.mining, 1)
-
-	for i := 0; i < threads; i++ {
-		self.worker.register(NewCpuAgent(i, self.pow))
-	}
-
-	glog.V(logger.Info).Infof("Starting mining operation (CPU=%d TOT=%d)\n", threads, len(self.worker.agents))
-
-	self.worker.start()
-
-	self.worker.commitNewWork()
-}
-
-func (self *Miner) Stop() {
-	self.worker.stop()
-	atomic.StoreInt32(&self.mining, 0)
-	atomic.StoreInt32(&self.shouldStart, 0)
-}
-
-func (self *Miner) Register(agent Agent) {
-	if self.Mining() {
-		agent.Start()
-	}
-	self.worker.register(agent)
-}
-
-func (self *Miner) Unregister(agent Agent) {
-	self.worker.unregister(agent)
-}
-
-func (self *Miner) Mining() bool {
-	return atomic.LoadInt32(&self.mining) > 0
-}
-
-func (self *Miner) HashRate() (tot int64) {
-	tot += self.pow.GetHashrate()
-	// do we care this might race? is it worth we're rewriting some
-	// aspects of the worker/locking up agents so we can get an accurate
-	// hashrate?
-	for agent := range self.worker.agents {
-		tot += agent.GetHashRate()
-	}
-	return
-}
-
-func (self *Miner) SetExtra(extra []byte) error {
-	if uint64(len(extra)) > params.MaximumExtraDataSize.Uint64() {
-		return fmt.Errorf("Extra exceeds max length. %d > %v", len(extra), params.MaximumExtraDataSize)
-	}
-
-	self.worker.extra = extra
+	miner.confMu.Lock()
+	miner.config.ExtraData = extra
+	miner.confMu.Unlock()
 	return nil
 }
 
-// Pending returns the currently pending block and associated state.
-func (self *Miner) Pending() (*types.Block, *state.StateDB) {
-	return self.worker.pending()
+// SetPrioAddresses sets a list of addresses to prioritize for transaction inclusion.
+func (miner *Miner) SetPrioAddresses(prio []common.Address) {
+	miner.confMu.Lock()
+	miner.prio = prio
+	miner.confMu.Unlock()
 }
 
-func (self *Miner) SetEtherbase(addr common.Address) {
-	self.coinbase = addr
-	self.worker.setEtherbase(addr)
+// SetGasCeil sets the gaslimit to strive for when mining blocks post 1559.
+// For pre-1559 blocks, it sets the ceiling.
+func (miner *Miner) SetGasCeil(ceil uint64) {
+	miner.confMu.Lock()
+	miner.config.GasCeil = ceil
+	miner.confMu.Unlock()
+}
+
+// SetGasTip sets the minimum gas tip for inclusion.
+func (miner *Miner) SetGasTip(tip *big.Int) error {
+	miner.confMu.Lock()
+	miner.config.GasPrice = tip
+	miner.confMu.Unlock()
+	return nil
+}
+
+// BuildPayload builds the payload according to the provided parameters.
+func (miner *Miner) BuildPayload(ctx context.Context, args *BuildPayloadArgs, witness bool) (*Payload, error) {
+	return miner.buildPayload(ctx, args, witness)
+}
+
+// getPending retrieves the pending block based on the current head block.
+// The result might be nil if pending generation is failed.
+func (miner *Miner) getPending() *newPayloadResult {
+	header := miner.chain.CurrentHeader()
+	miner.pendingMu.Lock()
+	defer miner.pendingMu.Unlock()
+
+	if cached := miner.pending.resolve(header.Hash()); cached != nil {
+		return cached
+	}
+	var (
+		timestamp   = uint64(time.Now().Unix())
+		childNumber = new(big.Int).Add(header.Number, big.NewInt(1))
+		withdrawal  types.Withdrawals
+		slotNum     *uint64
+	)
+	// prepareWork raises the timestamp to parent+1 when the local clock is
+	// behind the head. Do it here too, so the fork rules match the block.
+	if header.Time >= timestamp {
+		timestamp = header.Time + 1
+	}
+	if miner.chainConfig.IsShanghai(childNumber, timestamp) {
+		withdrawal = []*types.Withdrawal{}
+	}
+	// Post-Amsterdam, prepareWork requires a slot number (EIP-7843). The pending
+	// block is synthetic and has no canonical slot, so derive one from the parent
+	// when available and fall back to zero otherwise.
+	if miner.chainConfig.IsAmsterdam(childNumber, timestamp) {
+		var n uint64
+		if header.SlotNumber != nil {
+			n = *header.SlotNumber + 1
+		}
+		slotNum = &n
+	}
+	ret := miner.generateWork(context.Background(),
+		&generateParams{
+			timestamp:   timestamp,
+			forceTime:   false,
+			parentHash:  header.Hash(),
+			coinbase:    miner.config.PendingFeeRecipient,
+			random:      common.Hash{},
+			withdrawals: withdrawal,
+			beaconRoot:  nil,
+			slotNum:     slotNum,
+			noTxs:       false,
+		}, false) // we will never make a witness for a pending block
+	if ret.err != nil {
+		return nil
+	}
+	miner.pending.update(header.Hash(), ret)
+	return ret
 }

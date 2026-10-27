@@ -14,20 +14,37 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
+//go:build darwin || dragonfly || freebsd || linux || nacl || netbsd || openbsd || solaris
 // +build darwin dragonfly freebsd linux nacl netbsd openbsd solaris
 
 package rpc
 
 import (
+	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 
-	"golang.org/x/net/context"
+	"github.com/ethereum/go-ethereum/log"
+)
+
+const (
+	// The limit of unix domain socket path diverse between OS, on Darwin it's 104 bytes
+	// but on Linux it's 108 byte, so we should depend on syscall.RawSockaddrUnix's
+	// definition dynamically
+	maxPathSize = len(syscall.RawSockaddrUnix{}.Path)
 )
 
 // ipcListen will create a Unix socket on the given endpoint.
 func ipcListen(endpoint string) (net.Listener, error) {
+	// account for null-terminator too
+	if len(endpoint)+1 > maxPathSize {
+		log.Warn(fmt.Sprintf("The ipc endpoint is longer than %d characters. ", maxPathSize-1),
+			"endpoint", endpoint)
+	}
+
 	// Ensure the IPC path exists and remove any previous leftover
 	if err := os.MkdirAll(filepath.Dir(endpoint), 0751); err != nil {
 		return nil, err
@@ -43,5 +60,5 @@ func ipcListen(endpoint string) (net.Listener, error) {
 
 // newIPCConnection will connect to a Unix socket on the given endpoint.
 func newIPCConnection(ctx context.Context, endpoint string) (net.Conn, error) {
-	return dialContext(ctx, "unix", endpoint)
+	return new(net.Dialer).DialContext(ctx, "unix", endpoint)
 }

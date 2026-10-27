@@ -17,210 +17,148 @@
 package tests
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
-	"runtime"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/logger/glog"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/holiman/uint256"
 )
 
-// Transaction Test JSON Format
-type TtTransaction struct {
-	Data     string
-	GasLimit string
-	GasPrice string
-	Nonce    string
-	R        string
-	S        string
-	To       string
-	V        string
-	Value    string
-}
-
+// TransactionTest checks RLP decoding and sender derivation of transactions.
 type TransactionTest struct {
-	Blocknumber string
-	Rlp         string
-	Sender      string
-	Transaction TtTransaction
+	Txbytes hexutil.Bytes `json:"txbytes"`
+	Result  map[string]*ttFork
 }
 
-func RunTransactionTestsWithReader(config *params.ChainConfig, r io.Reader, skipTests []string) error {
-	skipTest := make(map[string]bool, len(skipTests))
-	for _, name := range skipTests {
-		skipTest[name] = true
+type ttFork struct {
+	Sender       *common.UnprefixedAddress `json:"sender"`
+	Hash         *common.UnprefixedHash    `json:"hash"`
+	Exception    *string                   `json:"exception"`
+	IntrinsicGas math.HexOrDecimal64       `json:"intrinsicGas"`
+}
+
+func (tt *TransactionTest) validate() error {
+	if tt.Txbytes == nil {
+		return errors.New("missing txbytes")
 	}
-
-	bt := make(map[string]TransactionTest)
-	if err := readJson(r, &bt); err != nil {
-		return err
-	}
-
-	for name, test := range bt {
-		// if the test should be skipped, return
-		if skipTest[name] {
-			glog.Infoln("Skipping transaction test", name)
-			return nil
+	for name, fork := range tt.Result {
+		if err := tt.validateFork(fork); err != nil {
+			return fmt.Errorf("invalid %s: %v", name, err)
 		}
-		// test the block
-		if err := runTransactionTest(config, test); err != nil {
-			return err
-		}
-		glog.Infoln("Transaction test passed: ", name)
-
 	}
 	return nil
 }
 
-func RunTransactionTests(config *params.ChainConfig, file string, skipTests []string) error {
-	tests := make(map[string]TransactionTest)
-	if err := readJsonFile(file, &tests); err != nil {
-		return err
+func (tt *TransactionTest) validateFork(fork *ttFork) error {
+	if fork == nil {
+		return nil
 	}
-
-	if err := runTransactionTests(config, tests, skipTests); err != nil {
-		return err
+	if fork.Hash == nil && fork.Exception == nil {
+		return errors.New("missing hash and exception")
 	}
-	return nil
-}
-
-func runTransactionTests(config *params.ChainConfig, tests map[string]TransactionTest, skipTests []string) error {
-	skipTest := make(map[string]bool, len(skipTests))
-	for _, name := range skipTests {
-		skipTest[name] = true
-	}
-
-	for name, test := range tests {
-		// if the test should be skipped, return
-		if skipTest[name] {
-			glog.Infoln("Skipping transaction test", name)
-			return nil
-		}
-
-		// test the block
-		if err := runTransactionTest(config, test); err != nil {
-			return fmt.Errorf("%s: %v", name, err)
-		}
-		glog.Infoln("Transaction test passed: ", name)
-
+	if fork.Hash != nil && fork.Sender == nil {
+		return errors.New("missing sender")
 	}
 	return nil
 }
 
-func runTransactionTest(config *params.ChainConfig, txTest TransactionTest) (err error) {
-	tx := new(types.Transaction)
-	err = rlp.DecodeBytes(mustConvertBytes(txTest.Rlp), tx)
-
-	if err != nil {
-		if txTest.Sender == "" {
-			// RLP decoding failed and this is expected (test OK)
-			return nil
-		} else {
-			// RLP decoding failed but is expected to succeed (test FAIL)
-			return fmt.Errorf("RLP decoding failed when expected to succeed: %s", err)
-		}
-	}
-
-	validationError := verifyTxFields(config, txTest, tx)
-	if txTest.Sender == "" {
-		if validationError != nil {
-			// RLP decoding works but validation should fail (test OK)
-			return nil
-		} else {
-			// RLP decoding works but validation should fail (test FAIL)
-			// (this should not be possible but added here for completeness)
-			return errors.New("Field validations succeeded but should fail")
-		}
-	}
-
-	if txTest.Sender != "" {
-		if validationError == nil {
-			// RLP decoding works and validations pass (test OK)
-			return nil
-		} else {
-			// RLP decoding works and validations pass (test FAIL)
-			return fmt.Errorf("Field validations failed after RLP decoding: %s", validationError)
-		}
-	}
-	return errors.New("Should not happen: verify RLP decoding and field validation")
-}
-
-func verifyTxFields(chainConfig *params.ChainConfig, txTest TransactionTest, decodedTx *types.Transaction) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			buf := make([]byte, 64<<10)
-			buf = buf[:runtime.Stack(buf, false)]
-			err = fmt.Errorf("%v\n%s", recovered, buf)
-		}
-	}()
-
-	var decodedSender common.Address
-
-	signer := types.MakeSigner(chainConfig, common.String2Big(txTest.Blocknumber))
-	decodedSender, err = types.Sender(signer, decodedTx)
-	if err != nil {
+func (tt *TransactionTest) Run() error {
+	if err := tt.validate(); err != nil {
 		return err
 	}
-
-	expectedSender := mustConvertAddress(txTest.Sender)
-	if expectedSender != decodedSender {
-		return fmt.Errorf("Sender mismatch: %x %x", expectedSender, decodedSender)
-	}
-
-	expectedData := mustConvertBytes(txTest.Transaction.Data)
-	if !bytes.Equal(expectedData, decodedTx.Data()) {
-		return fmt.Errorf("Tx input data mismatch: %#v %#v", expectedData, decodedTx.Data())
-	}
-
-	expectedGasLimit := mustConvertBigInt(txTest.Transaction.GasLimit, 16)
-	if expectedGasLimit.Cmp(decodedTx.Gas()) != 0 {
-		return fmt.Errorf("GasLimit mismatch: %v %v", expectedGasLimit, decodedTx.Gas())
-	}
-
-	expectedGasPrice := mustConvertBigInt(txTest.Transaction.GasPrice, 16)
-	if expectedGasPrice.Cmp(decodedTx.GasPrice()) != 0 {
-		return fmt.Errorf("GasPrice mismatch: %v %v", expectedGasPrice, decodedTx.GasPrice())
-	}
-
-	expectedNonce := mustConvertUint(txTest.Transaction.Nonce, 16)
-	if expectedNonce != decodedTx.Nonce() {
-		return fmt.Errorf("Nonce mismatch: %v %v", expectedNonce, decodedTx.Nonce())
-	}
-
-	v, r, s := decodedTx.RawSignatureValues()
-	expectedR := mustConvertBigInt(txTest.Transaction.R, 16)
-	if r.Cmp(expectedR) != 0 {
-		return fmt.Errorf("R mismatch: %v %v", expectedR, r)
-	}
-	expectedS := mustConvertBigInt(txTest.Transaction.S, 16)
-	if s.Cmp(expectedS) != 0 {
-		return fmt.Errorf("S mismatch: %v %v", expectedS, s)
-	}
-	expectedV := mustConvertBigInt(txTest.Transaction.V, 16)
-	if v.Cmp(expectedV) != 0 {
-		return fmt.Errorf("V mismatch: %v %v", expectedV, v)
-	}
-
-	expectedTo := mustConvertAddress(txTest.Transaction.To)
-	if decodedTx.To() == nil {
-		if expectedTo != common.BytesToAddress([]byte{}) { // "empty" or "zero" address
-			return fmt.Errorf("To mismatch when recipient is nil (contract creation): %v", expectedTo)
+	validateTx := func(rlpData hexutil.Bytes, signer types.Signer, rules params.Rules) (sender common.Address, hash common.Hash, requiredGas uint64, err error) {
+		tx := new(types.Transaction)
+		if err = tx.UnmarshalBinary(rlpData); err != nil {
+			return
 		}
-	} else {
-		if expectedTo != *decodedTx.To() {
-			return fmt.Errorf("To mismatch: %v %v", expectedTo, *decodedTx.To())
+		sender, err = types.Sender(signer, tx)
+		if err != nil {
+			return
+		}
+		// Intrinsic cost
+		value, overflow := uint256.FromBig(tx.Value())
+		if overflow {
+			return sender, hash, 0, errors.New("value exceeds 256 bits")
+		}
+		cost, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), sender, tx.To(), value, rules)
+		if err != nil {
+			return
+		}
+		requiredGas = cost
+		if requiredGas > tx.Gas() {
+			return sender, hash, 0, fmt.Errorf("insufficient gas ( %d < %d )", tx.Gas(), requiredGas)
+		}
+
+		if rules.IsPrague {
+			var floorDataGas uint64
+			floorDataGas, err = core.FloorDataGas(rules, sender, tx.To(), value, tx.Data(), tx.AccessList())
+			if err != nil {
+				return
+			}
+			if tx.Gas() < floorDataGas {
+				return sender, hash, 0, fmt.Errorf("%w: have %d, want %d", core.ErrFloorDataGas, tx.Gas(), floorDataGas)
+			}
+		}
+		hash = tx.Hash()
+		return sender, hash, requiredGas, nil
+	}
+	for _, testcase := range []struct {
+		name    string
+		isMerge bool
+	}{
+		{"Frontier", false},
+		{"Homestead", false},
+		{"EIP150", false},
+		{"EIP158", false},
+		{"Byzantium", false},
+		{"Constantinople", false},
+		{"Istanbul", false},
+		{"Berlin", false},
+		{"London", false},
+		{"Paris", true},
+		{"Shanghai", true},
+		{"Cancun", true},
+		{"Prague", true},
+		{"Osaka", true},
+		{"Amsterdam", true},
+	} {
+		expected := tt.Result[testcase.name]
+		if expected == nil {
+			continue
+		}
+		config, ok := Forks[testcase.name]
+		if !ok || config == nil {
+			return UnsupportedForkError{Name: testcase.name}
+		}
+		var (
+			rules  = config.Rules(new(big.Int), testcase.isMerge, 0)
+			signer = types.MakeSigner(config, new(big.Int), 0)
+		)
+		sender, hash, gas, err := validateTx(tt.Txbytes, signer, rules)
+		if err != nil {
+			if expected.Hash != nil {
+				return fmt.Errorf("unexpected error fork %s: %v", testcase.name, err)
+			}
+			continue
+		}
+		if expected.Exception != nil {
+			return fmt.Errorf("expected error %v, got none (%v), fork %s", *expected.Exception, err, testcase.name)
+		}
+		if common.Hash(*expected.Hash) != hash {
+			return fmt.Errorf("hash mismatch: got %x, want %x", hash, common.Hash(*expected.Hash))
+		}
+		if common.Address(*expected.Sender) != sender {
+			return fmt.Errorf("sender mismatch: got %x, want %x", sender, expected.Sender)
+		}
+		if uint64(expected.IntrinsicGas) != gas {
+			return fmt.Errorf("intrinsic gas mismatch: got %d, want %d", gas, uint64(expected.IntrinsicGas))
 		}
 	}
-
-	expectedValue := mustConvertBigInt(txTest.Transaction.Value, 16)
-	if expectedValue.Cmp(decodedTx.Value()) != 0 {
-		return fmt.Errorf("Value mismatch: %v %v", expectedValue, decodedTx.Value())
-	}
-
 	return nil
 }

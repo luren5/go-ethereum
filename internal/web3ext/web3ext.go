@@ -14,168 +14,82 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-// package web3ext contains geth specific web3.js extensions.
+// Package web3ext contains geth specific web3.js extensions.
 package web3ext
 
 var Modules = map[string]string{
-	"admin":      Admin_JS,
-	"bzz":        Bzz_JS,
-	"chequebook": Chequebook_JS,
-	"debug":      Debug_JS,
-	"ens":        ENS_JS,
-	"eth":        Eth_JS,
-	"miner":      Miner_JS,
-	"net":        Net_JS,
-	"personal":   Personal_JS,
-	"rpc":        RPC_JS,
-	"shh":        Shh_JS,
-	"txpool":     TxPool_JS,
+	"admin":  AdminJs,
+	"clique": CliqueJs,
+	"debug":  DebugJs,
+	"eth":    EthJs,
+	"miner":  MinerJs,
+	"net":    NetJs,
+	"rpc":    RpcJs,
+	"txpool": TxpoolJs,
+	"dev":    DevJs,
 }
 
-const Bzz_JS = `
+const CliqueJs = `
 web3._extend({
-	property: 'bzz',
-	methods:
-	[
+	property: 'clique',
+	methods: [
 		new web3._extend.Method({
-			name: 'blockNetworkRead',
-			call: 'bzz_blockNetworkRead',
+			name: 'getSnapshot',
+			call: 'clique_getSnapshot',
+			params: 1,
+			inputFormatter: [web3._extend.formatters.inputBlockNumberFormatter]
+		}),
+		new web3._extend.Method({
+			name: 'getSnapshotAtHash',
+			call: 'clique_getSnapshotAtHash',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'getSigners',
+			call: 'clique_getSigners',
+			params: 1,
+			inputFormatter: [web3._extend.formatters.inputBlockNumberFormatter]
+		}),
+		new web3._extend.Method({
+			name: 'getSignersAtHash',
+			call: 'clique_getSignersAtHash',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'propose',
+			call: 'clique_propose',
+			params: 2
+		}),
+		new web3._extend.Method({
+			name: 'discard',
+			call: 'clique_discard',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'status',
+			call: 'clique_status',
+			params: 0
+		}),
+		new web3._extend.Method({
+			name: 'getSigner',
+			call: 'clique_getSigner',
 			params: 1,
 			inputFormatter: [null]
 		}),
-		new web3._extend.Method({
-			name: 'syncEnabled',
-			call: 'bzz_syncEnabled',
-			params: 1,
-			inputFormatter: [null]
-		}),
-		new web3._extend.Method({
-			name: 'swapEnabled',
-			call: 'bzz_swapEnabled',
-			params: 1,
-			inputFormatter: [null]
-		}),
-		new web3._extend.Method({
-			name: 'download',
-			call: 'bzz_download',
-			params: 2,
-			inputFormatter: [null, null]
-		}),
-		new web3._extend.Method({
-			name: 'upload',
-			call: 'bzz_upload',
-			params: 2,
-			inputFormatter: [null, null]
-		}),
-		new web3._extend.Method({
-			name: 'retrieve',
-			call: 'bzz_retrieve',
-			params: 1,
-			inputFormatter: [null]
-		}),
-		new web3._extend.Method({
-			name: 'store',
-			call: 'bzz_store',
-			params: 2,
-			inputFormatter: [null]
-		}),
-		new web3._extend.Method({
-			name: 'get',
-			call: 'bzz_get',
-			params: 1,
-			inputFormatter: [null]
-		}),
-		new web3._extend.Method({
-			name: 'put',
-			call: 'bzz_put',
-			params: 2,
-			inputFormatter: [null, null]
-		}),
-		new web3._extend.Method({
-			name: 'modify',
-			call: 'bzz_modify',
-			params: 4,
-			inputFormatter: [null, null, null, null]
-		})
 	],
-	properties:
-	[
+	properties: [
 		new web3._extend.Property({
-			name: 'hive',
-			getter: 'bzz_hive'
-		}),
-		new web3._extend.Property({
-			name: 'info',
-			getter: 'bzz_info',
+			name: 'proposals',
+			getter: 'clique_proposals'
 		}),
 	]
 });
 `
 
-const ENS_JS = `
-web3._extend({
-  property: 'ens',
-  methods:
-  [
-    new web3._extend.Method({
-			name: 'register',
-			call: 'ens_register',
-			params: 1,
-			inputFormatter: [null]
-		}),
-	new web3._extend.Method({
-			name: 'setContentHash',
-			call: 'ens_setContentHash',
-			params: 2,
-			inputFormatter: [null, null]
-		}),
-	new web3._extend.Method({
-			name: 'resolve',
-			call: 'ens_resolve',
-			params: 1,
-			inputFormatter: [null]
-		}),
-	]
-})
-`
-
-const Chequebook_JS = `
-web3._extend({
-  property: 'chequebook',
-  methods:
-  [
-    new web3._extend.Method({
-      name: 'deposit',
-      call: 'chequebook_deposit',
-      params: 1,
-      inputFormatter: [null]
-    }),
-    new web3._extend.Property({
-			name: 'balance',
-			getter: 'chequebook_balance',
-				outputFormatter: web3._extend.utils.toDecimal
-		}),
-    new web3._extend.Method({
-      name: 'cash',
-      call: 'chequebook_cash',
-      params: 1,
-      inputFormatter: [null]
-    }),
-    new web3._extend.Method({
-      name: 'issue',
-      call: 'chequebook_issue',
-      params: 2,
-      inputFormatter: [null, null]
-    }),
-  ]
-});
-`
-
-const Admin_JS = `
+const AdminJs = `
 web3._extend({
 	property: 'admin',
-	methods:
-	[
+	methods: [
 		new web3._extend.Method({
 			name: 'addPeer',
 			call: 'admin_addPeer',
@@ -187,10 +101,20 @@ web3._extend({
 			params: 1
 		}),
 		new web3._extend.Method({
+			name: 'addTrustedPeer',
+			call: 'admin_addTrustedPeer',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'removeTrustedPeer',
+			call: 'admin_removeTrustedPeer',
+			params: 1
+		}),
+		new web3._extend.Method({
 			name: 'exportChain',
 			call: 'admin_exportChain',
-			params: 1,
-			inputFormatter: [null]
+			params: 3,
+			inputFormatter: [null, null, null]
 		}),
 		new web3._extend.Method({
 			name: 'importChain',
@@ -203,16 +127,23 @@ web3._extend({
 			params: 2
 		}),
 		new web3._extend.Method({
-			name: 'setSolc',
-			call: 'admin_setSolc',
-			params: 1
+			name: 'startHTTP',
+			call: 'admin_startHTTP',
+			params: 5,
+			inputFormatter: [null, null, null, null, null]
 		}),
+		new web3._extend.Method({
+			name: 'stopHTTP',
+			call: 'admin_stopHTTP'
+		}),
+		// This method is deprecated.
 		new web3._extend.Method({
 			name: 'startRPC',
 			call: 'admin_startRPC',
-			params: 4,
-			inputFormatter: [null, null, null, null]
+			params: 5,
+			inputFormatter: [null, null, null, null, null]
 		}),
+		// This method is deprecated.
 		new web3._extend.Method({
 			name: 'stopRPC',
 			call: 'admin_stopRPC'
@@ -228,43 +159,12 @@ web3._extend({
 			call: 'admin_stopWS'
 		}),
 		new web3._extend.Method({
-			name: 'setGlobalRegistrar',
-			call: 'admin_setGlobalRegistrar',
-			params: 2
+			name: 'clearTxpool',
+			call: 'debug_clearTxpool',
+			params: 0
 		}),
-		new web3._extend.Method({
-			name: 'setHashReg',
-			call: 'admin_setHashReg',
-			params: 2
-		}),
-		new web3._extend.Method({
-			name: 'setUrlHint',
-			call: 'admin_setUrlHint',
-			params: 2
-		}),
-		new web3._extend.Method({
-			name: 'saveInfo',
-			call: 'admin_saveInfo',
-			params: 2
-		}),
-		new web3._extend.Method({
-			name: 'register',
-			call: 'admin_register',
-			params: 3
-		}),
-		new web3._extend.Method({
-			name: 'registerUrl',
-			call: 'admin_registerUrl',
-			params: 3
-		}),
-		new web3._extend.Method({
-			name: 'httpGet',
-			call: 'admin_httpGet',
-			params: 2
-		})
 	],
-	properties:
-	[
+	properties: [
 		new web3._extend.Property({
 			name: 'nodeInfo',
 			getter: 'admin_nodeInfo'
@@ -276,24 +176,45 @@ web3._extend({
 		new web3._extend.Property({
 			name: 'datadir',
 			getter: 'admin_datadir'
-		})
+		}),
 	]
 });
 `
 
-const Debug_JS = `
+const DebugJs = `
 web3._extend({
 	property: 'debug',
-	methods:
-	[
+	methods: [
+		new web3._extend.Method({
+			name: 'accountRange',
+			call: 'debug_accountRange',
+			params: 6,
+			inputFormatter: [web3._extend.formatters.inputDefaultBlockNumberFormatter, null, null, null, null, null],
+		}),
 		new web3._extend.Method({
 			name: 'printBlock',
 			call: 'debug_printBlock',
+			params: 1,
+			outputFormatter: console.log
+		}),
+		new web3._extend.Method({
+			name: 'getRawHeader',
+			call: 'debug_getRawHeader',
 			params: 1
 		}),
 		new web3._extend.Method({
-			name: 'getBlockRlp',
-			call: 'debug_getBlockRlp',
+			name: 'getRawBlock',
+			call: 'debug_getRawBlock',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'getRawReceipts',
+			call: 'debug_getRawReceipts',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'getRawTransaction',
+			call: 'debug_getRawTransaction',
 			params: 1
 		}),
 		new web3._extend.Method({
@@ -302,49 +223,19 @@ web3._extend({
 			params: 1
 		}),
 		new web3._extend.Method({
-			name: 'traceBlock',
-			call: 'debug_traceBlock',
-			params: 1
-		}),
-		new web3._extend.Method({
-			name: 'traceBlockByFile',
-			call: 'debug_traceBlockByFile',
-			params: 1
-		}),
-		new web3._extend.Method({
-			name: 'traceBlockByNumber',
-			call: 'debug_traceBlockByNumber',
-			params: 1
-		}),
-		new web3._extend.Method({
-			name: 'traceBlockByHash',
-			call: 'debug_traceBlockByHash',
-			params: 1
-		}),
-		new web3._extend.Method({
-			name: 'seedHash',
-			call: 'debug_seedHash',
-			params: 1
-		}),
-		new web3._extend.Method({
 			name: 'dumpBlock',
 			call: 'debug_dumpBlock',
-			params: 1
+			params: 1,
+			inputFormatter: [web3._extend.formatters.inputBlockNumberFormatter]
 		}),
 		new web3._extend.Method({
 			name: 'chaindbProperty',
 			call: 'debug_chaindbProperty',
-			params: 1,
 			outputFormatter: console.log
 		}),
 		new web3._extend.Method({
 			name: 'chaindbCompact',
 			call: 'debug_chaindbCompact',
-		}),
-		new web3._extend.Method({
-			name: 'metrics',
-			call: 'debug_metrics',
-			params: 1
 		}),
 		new web3._extend.Method({
 			name: 'verbosity',
@@ -357,15 +248,26 @@ web3._extend({
 			params: 1
 		}),
 		new web3._extend.Method({
-			name: 'backtraceAt',
-			call: 'debug_backtraceAt',
+			name: 'stacks',
+			call: 'debug_stacks',
+			params: 1,
+			inputFormatter: [null],
+			outputFormatter: console.log
+		}),
+		new web3._extend.Method({
+			name: 'freeOSMemory',
+			call: 'debug_freeOSMemory',
+			params: 0,
+		}),
+		new web3._extend.Method({
+			name: 'setGCPercent',
+			call: 'debug_setGCPercent',
 			params: 1,
 		}),
 		new web3._extend.Method({
-			name: 'stacks',
-			call: 'debug_stacks',
-			params: 0,
-			outputFormatter: console.log
+			name: 'setMemoryLimit',
+			call: 'debug_setMemoryLimit',
+			params: 1,
 		}),
 		new web3._extend.Method({
 			name: 'memStats',
@@ -423,26 +325,176 @@ web3._extend({
 			params: 1
 		}),
 		new web3._extend.Method({
+			name: 'mutexProfile',
+			call: 'debug_mutexProfile',
+			params: 2
+		}),
+		new web3._extend.Method({
+			name: 'setMutexProfileFraction',
+			call: 'debug_setMutexProfileFraction',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'writeMutexProfile',
+			call: 'debug_writeMutexProfile',
+			params: 1
+		}),
+		new web3._extend.Method({
 			name: 'writeMemProfile',
 			call: 'debug_writeMemProfile',
 			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'traceBlock',
+			call: 'debug_traceBlock',
+			params: 2,
+			inputFormatter: [null, null]
+		}),
+		new web3._extend.Method({
+			name: 'traceBlockFromFile',
+			call: 'debug_traceBlockFromFile',
+			params: 2,
+			inputFormatter: [null, null]
+		}),
+		new web3._extend.Method({
+			name: 'traceBadBlock',
+			call: 'debug_traceBadBlock',
+			params: 1,
+			inputFormatter: [null]
+		}),
+		new web3._extend.Method({
+			name: 'standardTraceBadBlockToFile',
+			call: 'debug_standardTraceBadBlockToFile',
+			params: 2,
+			inputFormatter: [null, null]
+		}),
+		new web3._extend.Method({
+			name: 'intermediateRoots',
+			call: 'debug_intermediateRoots',
+			params: 2,
+			inputFormatter: [null, null]
+		}),
+		new web3._extend.Method({
+			name: 'standardTraceBlockToFile',
+			call: 'debug_standardTraceBlockToFile',
+			params: 2,
+			inputFormatter: [null, null]
+		}),
+		new web3._extend.Method({
+			name: 'traceBlockByNumber',
+			call: 'debug_traceBlockByNumber',
+			params: 2,
+			inputFormatter: [web3._extend.formatters.inputBlockNumberFormatter, null]
+		}),
+		new web3._extend.Method({
+			name: 'traceBlockByHash',
+			call: 'debug_traceBlockByHash',
+			params: 2,
+			inputFormatter: [null, null]
 		}),
 		new web3._extend.Method({
 			name: 'traceTransaction',
 			call: 'debug_traceTransaction',
 			params: 2,
 			inputFormatter: [null, null]
-		})
+		}),
+		new web3._extend.Method({
+			name: 'traceCall',
+			call: 'debug_traceCall',
+			params: 3,
+			inputFormatter: [null, null, null]
+		}),
+		new web3._extend.Method({
+			name: 'preimage',
+			call: 'debug_preimage',
+			params: 1,
+			inputFormatter: [null]
+		}),
+		new web3._extend.Method({
+			name: 'getBadBlocks',
+			call: 'debug_getBadBlocks',
+			params: 1,
+			inputFormatter: [null]
+		}),
+		new web3._extend.Method({
+			name: 'replayBadBlock',
+			call: 'debug_replayBadBlock',
+			params: 1,
+			inputFormatter: [null]
+		}),
+		new web3._extend.Method({
+			name: 'storageRangeAt',
+			call: 'debug_storageRangeAt',
+			params: 5,
+		}),
+		new web3._extend.Method({
+			name: 'getModifiedAccountsByNumber',
+			call: 'debug_getModifiedAccountsByNumber',
+			params: 2,
+			inputFormatter: [null, null],
+		}),
+		new web3._extend.Method({
+			name: 'getModifiedAccountsByHash',
+			call: 'debug_getModifiedAccountsByHash',
+			params: 2,
+			inputFormatter:[null, null],
+		}),
+		new web3._extend.Method({
+			name: 'getAccessibleState',
+			call: 'debug_getAccessibleState',
+			params: 2,
+			inputFormatter:[web3._extend.formatters.inputBlockNumberFormatter, web3._extend.formatters.inputBlockNumberFormatter],
+		}),
+		new web3._extend.Method({
+			name: 'dbGet',
+			call: 'debug_dbGet',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'dbAncient',
+			call: 'debug_dbAncient',
+			params: 2
+		}),
+		new web3._extend.Method({
+			name: 'dbAncients',
+			call: 'debug_dbAncients',
+			params: 0
+		}),
+		new web3._extend.Method({
+			name: 'setTrieFlushInterval',
+			call: 'debug_setTrieFlushInterval',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'getTrieFlushInterval',
+			call: 'debug_getTrieFlushInterval',
+			params: 0
+		}),
+		new web3._extend.Method({
+			name: 'sync',
+			call: 'debug_sync',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'executionWitness',
+			call: 'debug_executionWitness',
+			params: 1,
+			inputFormatter: [null],
+		}),
 	],
 	properties: []
 });
 `
 
-const Eth_JS = `
+const EthJs = `
 web3._extend({
 	property: 'eth',
-	methods:
-	[
+	methods: [
+		new web3._extend.Method({
+			name: 'chainId',
+			call: 'eth_chainId',
+			params: 0
+		}),
 		new web3._extend.Method({
 			name: 'sign',
 			call: 'eth_sign',
@@ -456,22 +508,52 @@ web3._extend({
 			inputFormatter: [web3._extend.formatters.inputTransactionFormatter, web3._extend.utils.fromDecimal, web3._extend.utils.fromDecimal]
 		}),
 		new web3._extend.Method({
-			name: 'getNatSpec',
-			call: 'eth_getNatSpec',
-			params: 1,
-			inputFormatter: [web3._extend.formatters.inputTransactionFormatter]
-		}),
-		new web3._extend.Method({
 			name: 'signTransaction',
 			call: 'eth_signTransaction',
 			params: 1,
 			inputFormatter: [web3._extend.formatters.inputTransactionFormatter]
 		}),
 		new web3._extend.Method({
+			name: 'estimateGas',
+			call: 'eth_estimateGas',
+			params: 4,
+			inputFormatter: [web3._extend.formatters.inputCallFormatter, web3._extend.formatters.inputBlockNumberFormatter, null, null],
+			outputFormatter: web3._extend.utils.toDecimal
+		}),
+		new web3._extend.Method({
 			name: 'submitTransaction',
 			call: 'eth_submitTransaction',
 			params: 1,
 			inputFormatter: [web3._extend.formatters.inputTransactionFormatter]
+		}),
+		new web3._extend.Method({
+			name: 'fillTransaction',
+			call: 'eth_fillTransaction',
+			params: 1,
+			inputFormatter: [web3._extend.formatters.inputTransactionFormatter]
+		}),
+		new web3._extend.Method({
+			name: 'getHeaderByNumber',
+			call: 'eth_getHeaderByNumber',
+			params: 1,
+			inputFormatter: [web3._extend.formatters.inputBlockNumberFormatter]
+		}),
+		new web3._extend.Method({
+			name: 'getHeaderByHash',
+			call: 'eth_getHeaderByHash',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'getBlockByNumber',
+			call: 'eth_getBlockByNumber',
+			params: 2,
+			inputFormatter: [web3._extend.formatters.inputBlockNumberFormatter, function (val) { return !!val; }]
+		}),
+		new web3._extend.Method({
+			name: 'getBlockByHash',
+			call: 'eth_getBlockByHash',
+			params: 2,
+			inputFormatter: [null, function (val) { return !!val; }]
 		}),
 		new web3._extend.Method({
 			name: 'getRawTransaction',
@@ -485,10 +567,65 @@ web3._extend({
 			},
 			params: 2,
 			inputFormatter: [web3._extend.formatters.inputBlockNumberFormatter, web3._extend.utils.toHex]
+		}),
+		new web3._extend.Method({
+			name: 'getProof',
+			call: 'eth_getProof',
+			params: 3,
+			inputFormatter: [web3._extend.formatters.inputAddressFormatter, null, web3._extend.formatters.inputDefaultBlockNumberFormatter]
+		}),
+		new web3._extend.Method({
+			name: 'getStorageValues',
+			call: 'eth_getStorageValues',
+			params: 2,
+			inputFormatter: [null, web3._extend.formatters.inputDefaultBlockNumberFormatter]
+		}),
+		new web3._extend.Method({
+			name: 'createAccessList',
+			call: 'eth_createAccessList',
+			params: 2,
+			inputFormatter: [null, web3._extend.formatters.inputBlockNumberFormatter],
+		}),
+		new web3._extend.Method({
+			name: 'feeHistory',
+			call: 'eth_feeHistory',
+			params: 3,
+			inputFormatter: [null, web3._extend.formatters.inputBlockNumberFormatter, null]
+		}),
+		new web3._extend.Method({
+			name: 'getLogs',
+			call: 'eth_getLogs',
+			params: 1,
+		}),
+		new web3._extend.Method({
+			name: 'call',
+			call: 'eth_call',
+			params: 4,
+			inputFormatter: [web3._extend.formatters.inputCallFormatter, web3._extend.formatters.inputDefaultBlockNumberFormatter, null, null],
+		}),
+		new web3._extend.Method({
+			name: 'simulateV1',
+			call: 'eth_simulateV1',
+			params: 2,
+			inputFormatter: [null, web3._extend.formatters.inputDefaultBlockNumberFormatter],
+		}),
+		new web3._extend.Method({
+			name: 'getBlockReceipts',
+			call: 'eth_getBlockReceipts',
+			params: 1,
+		}),
+		new web3._extend.Method({
+			name: 'config',
+			call: 'eth_config',
+			params: 0,
+		}),
+		new web3._extend.Method({
+			name: 'capabilities',
+			call: 'eth_capabilities',
+			params: 0,
 		})
 	],
-	properties:
-	[
+	properties: [
 		new web3._extend.Property({
 			name: 'pendingTransactions',
 			getter: 'eth_pendingTransactions',
@@ -500,32 +637,20 @@ web3._extend({
 				}
 				return formatted;
 			}
-		})
+		}),
+		new web3._extend.Property({
+			name: 'maxPriorityFeePerGas',
+			getter: 'eth_maxPriorityFeePerGas',
+			outputFormatter: web3._extend.utils.toBigNumber
+		}),
 	]
 });
 `
 
-const Miner_JS = `
+const MinerJs = `
 web3._extend({
 	property: 'miner',
-	methods:
-	[
-		new web3._extend.Method({
-			name: 'start',
-			call: 'miner_start',
-			params: 1,
-			inputFormatter: [null]
-		}),
-		new web3._extend.Method({
-			name: 'stop',
-			call: 'miner_stop'
-		}),
-		new web3._extend.Method({
-			name: 'setEtherbase',
-			call: 'miner_setEtherbase',
-			params: 1,
-			inputFormatter: [web3._extend.formatters.inputAddressFormatter]
-		}),
+	methods: [
 		new web3._extend.Method({
 			name: 'setExtra',
 			call: 'miner_setExtra',
@@ -538,101 +663,43 @@ web3._extend({
 			inputFormatter: [web3._extend.utils.fromDecimal]
 		}),
 		new web3._extend.Method({
-			name: 'startAutoDAG',
-			call: 'miner_startAutoDAG',
-			params: 0
-		}),
-		new web3._extend.Method({
-			name: 'stopAutoDAG',
-			call: 'miner_stopAutoDAG',
-			params: 0
-		}),
-		new web3._extend.Method({
-			name: 'makeDAG',
-			call: 'miner_makeDAG',
+			name: 'setGasLimit',
+			call: 'miner_setGasLimit',
 			params: 1,
-			inputFormatter: [web3._extend.formatters.inputDefaultBlockNumberFormatter]
-		})
+			inputFormatter: [web3._extend.utils.fromDecimal]
+		}),
 	],
 	properties: []
 });
 `
 
-const Net_JS = `
+const NetJs = `
 web3._extend({
 	property: 'net',
 	methods: [],
-	properties:
-	[
+	properties: [
 		new web3._extend.Property({
 			name: 'version',
 			getter: 'net_version'
-		})
+		}),
 	]
 });
 `
 
-const Personal_JS = `
-web3._extend({
-	property: 'personal',
-	methods:
-	[
-		new web3._extend.Method({
-			name: 'importRawKey',
-			call: 'personal_importRawKey',
-			params: 2
-		}),
-		new web3._extend.Method({
-			name: 'sendTransaction',
-			call: 'personal_sendTransaction',
-			params: 2,
-			inputFormatter: [web3._extend.formatters.inputTransactionFormatter, null]
-		}),
-		new web3._extend.Method({
-			name: 'sign',
-			call: 'personal_sign',
-			params: 3,
-			inputFormatter: [null, web3._extend.formatters.inputAddressFormatter, null]
-		}),
-		new web3._extend.Method({
-			name: 'ecRecover',
-			call: 'personal_ecRecover',
-			params: 2
-		})
-	]
-})
-`
-
-const RPC_JS = `
+const RpcJs = `
 web3._extend({
 	property: 'rpc',
 	methods: [],
-	properties:
-	[
+	properties: [
 		new web3._extend.Property({
 			name: 'modules',
 			getter: 'rpc_modules'
-		})
+		}),
 	]
 });
 `
 
-const Shh_JS = `
-web3._extend({
-	property: 'shh',
-	methods: [],
-	properties:
-	[
-		new web3._extend.Property({
-			name: 'version',
-			getter: 'shh_version',
-			outputFormatter: web3._extend.utils.toDecimal
-		})
-	]
-});
-`
-
-const TxPool_JS = `
+const TxpoolJs = `
 web3._extend({
 	property: 'txpool',
 	methods: [],
@@ -654,7 +721,31 @@ web3._extend({
 				status.queued = web3._extend.utils.toDecimal(status.queued);
 				return status;
 			}
-		})
+		}),
+		new web3._extend.Method({
+			name: 'contentFrom',
+			call: 'txpool_contentFrom',
+			params: 1,
+		}),
 	]
+});
+`
+
+const DevJs = `
+web3._extend({
+	property: 'dev',
+	methods:
+	[
+		new web3._extend.Method({
+			name: 'addWithdrawal',
+			call: 'dev_addWithdrawal',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'setFeeRecipient',
+			call: 'dev_setFeeRecipient',
+			params: 1
+		}),
+	],
 });
 `

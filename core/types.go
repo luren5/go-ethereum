@@ -17,46 +17,50 @@
 package core
 
 import (
-	"math/big"
+	"context"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 )
 
-// Validator is an interface which defines the standard for block validation.
-//
-// The validator is responsible for validating incoming block or, if desired,
-// validates headers for fast validation.
-//
-// ValidateBlock validates the given block and should return an error if it
-// failed to do so and should be used for "full" validation.
-//
-// ValidateHeader validates the given header and parent and returns an error
-// if it failed to do so.
-//
-// ValidateState validates the given statedb and optionally the receipts and
-// gas used. The implementer should decide what to do with the given input.
+// Validator is an interface which defines the standard for block validation. It
+// is only responsible for validating block contents, as the header validation is
+// done by the specific consensus engines.
 type Validator interface {
-	HeaderValidator
-	ValidateBlock(block *types.Block) error
-	ValidateState(block, parent *types.Block, state *state.StateDB, receipts types.Receipts, usedGas *big.Int) error
+	// ValidateBody validates the given block's content.
+	ValidateBody(block *types.Block) error
+
+	// ValidateState validates the given statedb and optionally the process result.
+	ValidateState(block *types.Block, state *state.StateDB, res *ProcessResult, stateless bool) error
 }
 
-// HeaderValidator is an interface for validating headers only
-//
-// ValidateHeader validates the given header and parent and returns an error
-// if it failed to do so.
-type HeaderValidator interface {
-	ValidateHeader(header, parent *types.Header, checkPow bool) error
+// Prefetcher is an interface for pre-caching transaction signatures and state.
+type Prefetcher interface {
+	// Prefetch processes the state changes according to the Ethereum rules by running
+	// the transaction messages using the statedb, but any changes are discarded. The
+	// only goal is to pre-cache transaction signatures and state trie nodes.
+	Prefetch(block *types.Block, statedb *state.StateDB, jumpDestCache vm.JumpDestCache, precompileCache *vm.PrecompileCache, cfg vm.Config, interrupt *atomic.Bool, execIndex *atomic.Int64)
 }
 
 // Processor is an interface for processing blocks using a given initial state.
-//
-// Process takes the block to be processed and the statedb upon which the
-// initial state is based. It should return the receipts generated, amount
-// of gas used in the process and return an error if any of the internal rules
-// failed.
 type Processor interface {
-	Process(block *types.Block, statedb *state.StateDB, cfg vm.Config) (types.Receipts, vm.Logs, *big.Int, error)
+	// Process processes the state changes according to the Ethereum rules by running
+	// the transaction messages using the statedb and applying any rewards to both
+	// the processor (coinbase) and any included uncles.
+	Process(ctx context.Context, block *types.Block, statedb *state.StateDB, jumpDestCache vm.JumpDestCache, precompileCache *vm.PrecompileCache, cfg vm.Config, execIndex *atomic.Int64) (*ProcessResult, error)
+}
+
+// ProcessResult contains the values computed by Process.
+type ProcessResult struct {
+	Receipts types.Receipts
+	Requests [][]byte
+	Logs     []*types.Log
+	GasUsed  uint64
+
+	// pipeline digests the receipts and the access list alongside execution
+	// and validation. It is nil for a result assembled elsewhere, and the
+	// validator computes the receipt digests itself in that case.
+	pipeline *digestPipeline
 }

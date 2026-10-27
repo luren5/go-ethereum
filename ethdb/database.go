@@ -14,294 +14,214 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
+// Package ethdb defines the interfaces for an Ethereum data store.
 package ethdb
 
 import (
-	"path/filepath"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
-
-	"github.com/ethereum/go-ethereum/logger"
-	"github.com/ethereum/go-ethereum/logger/glog"
-	"github.com/ethereum/go-ethereum/metrics"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/errors"
-	"github.com/syndtr/goleveldb/leveldb/filter"
-	"github.com/syndtr/goleveldb/leveldb/iterator"
-	"github.com/syndtr/goleveldb/leveldb/opt"
-
-	gometrics "github.com/rcrowley/go-metrics"
+	"bytes"
+	"errors"
+	"io"
 )
 
-var OpenFileLimit = 64
+var (
+	// MaximumKey is a special marker representing the largest possible key
+	// in the database.
+	//
+	// All prefixed database entries will be smaller than this marker.
+	// For trie nodes in hash mode, we use a 32-byte slice filled with 0xFF
+	// because there may be shared prefixes starting with multiple 0xFF bytes.
+	// Using 32 bytes ensures that only a hash collision could potentially
+	// match or exceed it.
+	MaximumKey = bytes.Repeat([]byte{0xff}, 32)
+)
 
-// cacheRatio specifies how the total allotted cache is distributed between the
-// various system databases.
-var cacheRatio = map[string]float64{
-	"chaindata":      1.0,
-	"lightchaindata": 1.0,
+// KeyValueReader wraps the Has and Get method of a backing data store.
+type KeyValueReader interface {
+	// Has retrieves if a key is present in the key-value data store.
+	Has(key []byte) (bool, error)
+
+	// Get retrieves the given key if it's present in the key-value data store.
+	Get(key []byte) ([]byte, error)
 }
 
-// handleRatio specifies how the total allotted file descriptors is distributed
-// between the various system databases.
-var handleRatio = map[string]float64{
-	"chaindata":      1.0,
-	"lightchaindata": 1.0,
+// KeyValueWriter wraps the Put method of a backing data store.
+type KeyValueWriter interface {
+	// Put inserts the given value into the key-value data store.
+	Put(key []byte, value []byte) error
+
+	// Delete removes the key from the key-value data store.
+	Delete(key []byte) error
 }
 
-type LDBDatabase struct {
-	fn string      // filename for reporting
-	db *leveldb.DB // LevelDB instance
+var ErrTooManyKeys = errors.New("too many keys in deleted range")
 
-	getTimer       gometrics.Timer // Timer for measuring the database get request counts and latencies
-	putTimer       gometrics.Timer // Timer for measuring the database put request counts and latencies
-	delTimer       gometrics.Timer // Timer for measuring the database delete request counts and latencies
-	missMeter      gometrics.Meter // Meter for measuring the missed database get requests
-	readMeter      gometrics.Meter // Meter for measuring the database get request data usage
-	writeMeter     gometrics.Meter // Meter for measuring the database put request data usage
-	compTimeMeter  gometrics.Meter // Meter for measuring the total time spent in database compaction
-	compReadMeter  gometrics.Meter // Meter for measuring the data read during compaction
-	compWriteMeter gometrics.Meter // Meter for measuring the data written during compaction
-
-	quitLock sync.Mutex      // Mutex protecting the quit channel access
-	quitChan chan chan error // Quit channel to stop the metrics collection before closing the database
+// KeyValueRangeDeleter wraps the DeleteRange method of a backing data store.
+type KeyValueRangeDeleter interface {
+	// DeleteRange deletes all of the keys (and values) in the range [start,end)
+	// (inclusive on start, exclusive on end).
+	//
+	// A nil start is treated as a key before all keys in the data store; a nil
+	// end is treated as a key after all keys in the data store. If both is nil
+	// then the entire data store will be purged.
+	//
+	// Some implementations of DeleteRange may return ErrTooManyKeys after
+	// partially deleting entries in the given range.
+	DeleteRange(start, end []byte) error
 }
 
-// NewLDBDatabase returns a LevelDB wrapped object.
-func NewLDBDatabase(file string, cache int, handles int) (*LDBDatabase, error) {
-	// Calculate the cache and file descriptor allowance for this particular database
-	cache = int(float64(cache) * cacheRatio[filepath.Base(file)])
-	if cache < 16 {
-		cache = 16
-	}
-	handles = int(float64(handles) * handleRatio[filepath.Base(file)])
-	if handles < 16 {
-		handles = 16
-	}
-	glog.V(logger.Info).Infof("Allotted %dMB cache and %d file handles to %s", cache, handles, file)
-
-	// Open the db and recover any potential corruptions
-	db, err := leveldb.OpenFile(file, &opt.Options{
-		OpenFilesCacheCapacity: handles,
-		BlockCacheCapacity:     cache / 2 * opt.MiB,
-		WriteBuffer:            cache / 4 * opt.MiB, // Two of these are used internally
-		Filter:                 filter.NewBloomFilter(10),
-	})
-	if _, corrupted := err.(*errors.ErrCorrupted); corrupted {
-		db, err = leveldb.RecoverFile(file, nil)
-	}
-	// (Re)check for errors and abort if opening of the db failed
-	if err != nil {
-		return nil, err
-	}
-	return &LDBDatabase{
-		fn: file,
-		db: db,
-	}, nil
+// KeyValueStater wraps the Stat method of a backing data store.
+type KeyValueStater interface {
+	// Stat returns the statistic data of the database.
+	Stat() (string, error)
 }
 
-// Path returns the path to the database directory.
-func (db *LDBDatabase) Path() string {
-	return db.fn
+// KeyValueSyncer wraps the SyncKeyValue method of a backing data store.
+type KeyValueSyncer interface {
+	// SyncKeyValue ensures that all pending writes are flushed to disk,
+	// guaranteeing data durability up to the point.
+	SyncKeyValue() error
 }
 
-// Put puts the given key / value to the queue
-func (self *LDBDatabase) Put(key []byte, value []byte) error {
-	// Measure the database put latency, if requested
-	if self.putTimer != nil {
-		defer self.putTimer.UpdateSince(time.Now())
-	}
-	// Generate the data to write to disk, update the meter and write
-	//value = rle.Compress(value)
-
-	if self.writeMeter != nil {
-		self.writeMeter.Mark(int64(len(value)))
-	}
-	return self.db.Put(key, value, nil)
+// Compacter wraps the Compact method of a backing data store.
+type Compacter interface {
+	// Compact flattens the underlying data store for the given key range. In essence,
+	// deleted and overwritten versions are discarded, and the data is rearranged to
+	// reduce the cost of operations needed to access them.
+	//
+	// A nil start is treated as a key before all keys in the data store; a nil limit
+	// is treated as a key after all keys in the data store. If both is nil then it
+	// will compact entire data store.
+	Compact(start []byte, limit []byte) error
 }
 
-// Get returns the given key if it's present.
-func (self *LDBDatabase) Get(key []byte) ([]byte, error) {
-	// Measure the database get latency, if requested
-	if self.getTimer != nil {
-		defer self.getTimer.UpdateSince(time.Now())
-	}
-	// Retrieve the key and increment the miss counter if not found
-	dat, err := self.db.Get(key, nil)
-	if err != nil {
-		if self.missMeter != nil {
-			self.missMeter.Mark(1)
-		}
-		return nil, err
-	}
-	// Otherwise update the actually retrieved amount of data
-	if self.readMeter != nil {
-		self.readMeter.Mark(int64(len(dat)))
-	}
-	return dat, nil
-	//return rle.Decompress(dat)
+// KeyValueStore contains all the methods required to allow handling different
+// key-value data stores backing the high level database.
+type KeyValueStore interface {
+	KeyValueReader
+	KeyValueWriter
+	KeyValueStater
+	KeyValueSyncer
+	KeyValueRangeDeleter
+	Batcher
+	Iteratee
+	Compacter
+	io.Closer
 }
 
-// Delete deletes the key from the queue and database
-func (self *LDBDatabase) Delete(key []byte) error {
-	// Measure the database delete latency, if requested
-	if self.delTimer != nil {
-		defer self.delTimer.UpdateSince(time.Now())
-	}
-	// Execute the actual operation
-	return self.db.Delete(key, nil)
+// AncientReaderOp contains the methods required to read from immutable ancient data.
+type AncientReaderOp interface {
+	// Ancient retrieves an ancient binary blob from the append-only immutable files.
+	Ancient(kind string, number uint64) ([]byte, error)
+
+	// AncientRange retrieves multiple items in sequence, starting from the index 'start'.
+	// It will return
+	//   - at most 'count' items,
+	//   - if maxBytes is specified: at least 1 item (even if exceeding the maxByteSize),
+	//     but will otherwise return as many items as fit into maxByteSize.
+	//   - if maxBytes is not specified, 'count' items will be returned if they are present
+	AncientRange(kind string, start, count, maxBytes uint64) ([][]byte, error)
+
+	// AncientBytes retrieves the value segment of the element specified by the id
+	// and value offsets.
+	AncientBytes(kind string, id, offset, length uint64) ([]byte, error)
+
+	// Ancients returns the ancient item numbers in the ancient store.
+	Ancients() (uint64, error)
+
+	// Tail returns the lowest accessible item index for the given tail group.
+	// This number can also be interpreted as the total deleted items in the
+	// group. Tables sharing a group are pruned together and therefore agree
+	// on the value. An empty group name refers to non-prunable tables and
+	// always returns 0.
+	Tail(group string) (uint64, error)
+
+	// AncientSize returns the ancient size of the specified category.
+	AncientSize(kind string) (uint64, error)
 }
 
-func (self *LDBDatabase) NewIterator() iterator.Iterator {
-	return self.db.NewIterator(nil, nil)
+// AncientReader is the extended ancient reader interface including 'batched' or 'atomic' reading.
+type AncientReader interface {
+	AncientReaderOp
+
+	// ReadAncients runs the given read operation while ensuring that no writes take place
+	// on the underlying ancient store.
+	ReadAncients(fn func(AncientReaderOp) error) (err error)
 }
 
-func (self *LDBDatabase) Close() {
-	// Stop the metrics collection to avoid internal database races
-	self.quitLock.Lock()
-	defer self.quitLock.Unlock()
+// AncientWriter contains the methods required to write to immutable ancient data.
+type AncientWriter interface {
+	// ModifyAncients runs a write operation on the ancient store.
+	// If the function returns an error, any changes to the underlying store are reverted.
+	// The integer return value is the total size of the written data.
+	ModifyAncients(func(AncientWriteOp) error) (int64, error)
 
-	if self.quitChan != nil {
-		errc := make(chan error)
-		self.quitChan <- errc
-		if err := <-errc; err != nil {
-			glog.V(logger.Error).Infof("metrics failure in '%s': %v\n", self.fn, err)
-		}
-	}
-	err := self.db.Close()
-	if glog.V(logger.Error) {
-		if err == nil {
-			glog.Infoln("closed db:", self.fn)
-		} else {
-			glog.Errorf("error closing db %s: %v", self.fn, err)
-		}
-	}
+	// SyncAncient flushes all in-memory ancient store data to disk.
+	SyncAncient() error
+
+	// TruncateHead discards all but the first n ancient data from the ancient store.
+	// After the truncation, the latest item can be accessed it item_n-1(start from 0).
+	TruncateHead(n uint64) (uint64, error)
+
+	// TruncateTail discards the first n items from every table belonging to
+	// the named tail group. Already-deleted items are ignored. After the
+	// truncation, the earliest accessible item in the group is item_n
+	// (starting from 0). Deleted items may not be removed from disk
+	// immediately, but only once the accumulated deleted data reaches the
+	// threshold, at which point they are removed all together.
+	//
+	// The previous tail of the group is returned. Tables outside the group
+	// (including non-prunable ones) are untouched.
+	TruncateTail(group string, n uint64) (uint64, error)
 }
 
-func (self *LDBDatabase) LDB() *leveldb.DB {
-	return self.db
+// AncientWriteOp is given to the function argument of ModifyAncients.
+type AncientWriteOp interface {
+	// Append adds an RLP-encoded item.
+	Append(kind string, number uint64, item interface{}) error
+
+	// AppendRaw adds an item without RLP-encoding it.
+	AppendRaw(kind string, number uint64, item []byte) error
 }
 
-// Meter configures the database metrics collectors and
-func (self *LDBDatabase) Meter(prefix string) {
-	// Short circuit metering if the metrics system is disabled
-	if !metrics.Enabled {
-		return
-	}
-	// Initialize all the metrics collector at the requested prefix
-	self.getTimer = metrics.NewTimer(prefix + "user/gets")
-	self.putTimer = metrics.NewTimer(prefix + "user/puts")
-	self.delTimer = metrics.NewTimer(prefix + "user/dels")
-	self.missMeter = metrics.NewMeter(prefix + "user/misses")
-	self.readMeter = metrics.NewMeter(prefix + "user/reads")
-	self.writeMeter = metrics.NewMeter(prefix + "user/writes")
-	self.compTimeMeter = metrics.NewMeter(prefix + "compact/time")
-	self.compReadMeter = metrics.NewMeter(prefix + "compact/input")
-	self.compWriteMeter = metrics.NewMeter(prefix + "compact/output")
-
-	// Create a quit channel for the periodic collector and run it
-	self.quitLock.Lock()
-	self.quitChan = make(chan chan error)
-	self.quitLock.Unlock()
-
-	go self.meter(3 * time.Second)
+// AncientStater wraps the Stat method of a backing ancient store.
+type AncientStater interface {
+	// AncientDatadir returns the path of the ancient store directory.
+	//
+	// If the ancient store is not activated, an error is returned.
+	// If an ephemeral ancient store is used, an empty path is returned.
+	//
+	// The path returned by AncientDatadir can be used as the root path
+	// of the ancient store to construct paths for other sub ancient stores.
+	AncientDatadir() (string, error)
 }
 
-// meter periodically retrieves internal leveldb counters and reports them to
-// the metrics subsystem.
-//
-// This is how a stats table look like (currently):
-//   Compactions
-//    Level |   Tables   |    Size(MB)   |    Time(sec)  |    Read(MB)   |   Write(MB)
-//   -------+------------+---------------+---------------+---------------+---------------
-//      0   |          0 |       0.00000 |       1.27969 |       0.00000 |      12.31098
-//      1   |         85 |     109.27913 |      28.09293 |     213.92493 |     214.26294
-//      2   |        523 |    1000.37159 |       7.26059 |      66.86342 |      66.77884
-//      3   |        570 |    1113.18458 |       0.00000 |       0.00000 |       0.00000
-func (self *LDBDatabase) meter(refresh time.Duration) {
-	// Create the counters to store current and previous values
-	counters := make([][]float64, 2)
-	for i := 0; i < 2; i++ {
-		counters[i] = make([]float64, 3)
-	}
-	// Iterate ad infinitum and collect the stats
-	for i := 1; ; i++ {
-		// Retrieve the database stats
-		stats, err := self.db.GetProperty("leveldb.stats")
-		if err != nil {
-			glog.V(logger.Error).Infof("failed to read database stats: %v", err)
-			return
-		}
-		// Find the compaction table, skip the header
-		lines := strings.Split(stats, "\n")
-		for len(lines) > 0 && strings.TrimSpace(lines[0]) != "Compactions" {
-			lines = lines[1:]
-		}
-		if len(lines) <= 3 {
-			glog.V(logger.Error).Infof("compaction table not found")
-			return
-		}
-		lines = lines[3:]
-
-		// Iterate over all the table rows, and accumulate the entries
-		for j := 0; j < len(counters[i%2]); j++ {
-			counters[i%2][j] = 0
-		}
-		for _, line := range lines {
-			parts := strings.Split(line, "|")
-			if len(parts) != 6 {
-				break
-			}
-			for idx, counter := range parts[3:] {
-				if value, err := strconv.ParseFloat(strings.TrimSpace(counter), 64); err != nil {
-					glog.V(logger.Error).Infof("compaction entry parsing failed: %v", err)
-					return
-				} else {
-					counters[i%2][idx] += value
-				}
-			}
-		}
-		// Update all the requested meters
-		if self.compTimeMeter != nil {
-			self.compTimeMeter.Mark(int64((counters[i%2][0] - counters[(i-1)%2][0]) * 1000 * 1000 * 1000))
-		}
-		if self.compReadMeter != nil {
-			self.compReadMeter.Mark(int64((counters[i%2][1] - counters[(i-1)%2][1]) * 1024 * 1024))
-		}
-		if self.compWriteMeter != nil {
-			self.compWriteMeter.Mark(int64((counters[i%2][2] - counters[(i-1)%2][2]) * 1024 * 1024))
-		}
-		// Sleep a bit, then repeat the stats collection
-		select {
-		case errc := <-self.quitChan:
-			// Quit requesting, stop hammering the database
-			errc <- nil
-			return
-
-		case <-time.After(refresh):
-			// Timeout, gather a new set of stats
-		}
-	}
+// Reader contains the methods required to read data from both key-value as well as
+// immutable ancient data.
+type Reader interface {
+	KeyValueReader
+	AncientReader
 }
 
-// TODO: remove this stuff and expose leveldb directly
-
-func (db *LDBDatabase) NewBatch() Batch {
-	return &ldbBatch{db: db.db, b: new(leveldb.Batch)}
+// AncientStore contains all the methods required to allow handling different
+// ancient data stores backing immutable data store.
+type AncientStore interface {
+	AncientReader
+	AncientWriter
+	AncientStater
+	io.Closer
 }
 
-type ldbBatch struct {
-	db *leveldb.DB
-	b  *leveldb.Batch
+// ResettableAncientStore extends the AncientStore interface by adding a Reset method.
+type ResettableAncientStore interface {
+	AncientStore
+
+	// Reset is designed to reset the entire ancient store to its default state.
+	Reset() error
 }
 
-func (b *ldbBatch) Put(key, value []byte) error {
-	b.b.Put(key, value)
-	return nil
-}
-
-func (b *ldbBatch) Write() error {
-	return b.db.Write(b.b, nil)
+// Database contains all the methods required by the high level database to not
+// only access the key-value data store but also the ancient chain store.
+type Database interface {
+	KeyValueStore
+	AncientStore
 }

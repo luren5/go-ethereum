@@ -2,123 +2,62 @@
 # with Go source code. If you know what GOPATH is then you probably
 # don't need to bother with make.
 
-.PHONY: geth geth-cross evm all test clean
-.PHONY: geth-linux geth-linux-386 geth-linux-amd64 geth-linux-mips64 geth-linux-mips64le
-.PHONY: geth-linux-arm geth-linux-arm-5 geth-linux-arm-6 geth-linux-arm-7 geth-linux-arm64
-.PHONY: geth-darwin geth-darwin-386 geth-darwin-amd64
-.PHONY: geth-windows geth-windows-386 geth-windows-amd64
-.PHONY: geth-android geth-ios
+.PHONY: geth evm all test lint fmt clean devtools help
 
-GOBIN = build/bin
+GOBIN = ./build/bin
 GO ?= latest
+GORUN = go run
 
+#? geth: Build geth.
 geth:
-	build/env.sh go run build/ci.go install ./cmd/geth
+	$(GORUN) build/ci.go install ./cmd/geth
 	@echo "Done building."
 	@echo "Run \"$(GOBIN)/geth\" to launch geth."
 
+#? evm: Build evm.
 evm:
-	build/env.sh go run build/ci.go install ./cmd/evm
+	$(GORUN) build/ci.go install ./cmd/evm
 	@echo "Done building."
-	@echo "Run \"$(GOBIN)/evm to start the evm."
+	@echo "Run \"$(GOBIN)/evm\" to launch evm."
 
+#? all: Build all packages and executables.
 all:
-	build/env.sh go run build/ci.go install
+	$(GORUN) build/ci.go install
 
+#? test: Run the tests.
 test: all
-	build/env.sh go run build/ci.go test
+	$(GORUN) build/ci.go test
 
+#? lint: Run certain pre-selected linters.
+lint: ## Run linters.
+	$(GORUN) build/ci.go lint
+
+#? fmt: Ensure consistent code formatting.
+fmt:
+	gofmt -s -w $(shell find . -name "*.go")
+
+#? clean: Clean go cache, built executables, and the auto generated folder.
 clean:
+	go clean -cache
 	rm -fr build/_workspace/pkg/ $(GOBIN)/*
 
-# Cross Compilation Targets (xgo)
+# The devtools target installs tools required for 'go generate'.
+# You need to put $GOBIN (or $GOPATH/bin) in your PATH to use 'go generate'.
 
-geth-cross: geth-linux geth-darwin geth-windows geth-android geth-ios
-	@echo "Full cross compilation done:"
-	@ls -ld $(GOBIN)/geth-*
+#? devtools: Install recommended developer tools.
+devtools:
+	env GOBIN= go install golang.org/x/tools/cmd/stringer@latest
+	env GOBIN= go install github.com/fjl/gencodec@latest
+	env GOBIN= go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+	env GOBIN= go install ./cmd/abigen
+	@type "solc" 2> /dev/null || echo 'Please install solc'
+	@type "protoc" 2> /dev/null || echo 'Please install protoc'
 
-geth-linux: geth-linux-386 geth-linux-amd64 geth-linux-arm geth-linux-mips64 geth-linux-mips64le
-	@echo "Linux cross compilation done:"
-	@ls -ld $(GOBIN)/geth-linux-*
-
-geth-linux-386:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=linux/386 -v ./cmd/geth
-	@echo "Linux 386 cross compilation done:"
-	@ls -ld $(GOBIN)/geth-linux-* | grep 386
-
-geth-linux-amd64:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=linux/amd64 -v ./cmd/geth
-	@echo "Linux amd64 cross compilation done:"
-	@ls -ld $(GOBIN)/geth-linux-* | grep amd64
-
-geth-linux-arm: geth-linux-arm-5 geth-linux-arm-6 geth-linux-arm-7 geth-linux-arm64
-	@echo "Linux ARM cross compilation done:"
-	@ls -ld $(GOBIN)/geth-linux-* | grep arm
-
-geth-linux-arm-5:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=linux/arm-5 -v ./cmd/geth
-	@echo "Linux ARMv5 cross compilation done:"
-	@ls -ld $(GOBIN)/geth-linux-* | grep arm-5
-
-geth-linux-arm-6:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=linux/arm-6 -v ./cmd/geth
-	@echo "Linux ARMv6 cross compilation done:"
-	@ls -ld $(GOBIN)/geth-linux-* | grep arm-6
-
-geth-linux-arm-7:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=linux/arm-7 -v ./cmd/geth
-	@echo "Linux ARMv7 cross compilation done:"
-	@ls -ld $(GOBIN)/geth-linux-* | grep arm-7
-
-geth-linux-arm64:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=linux/arm64 -v ./cmd/geth
-	@echo "Linux ARM64 cross compilation done:"
-	@ls -ld $(GOBIN)/geth-linux-* | grep arm64
-
-geth-linux-mips64:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=linux/mips64 -v ./cmd/geth
-	@echo "Linux MIPS64 cross compilation done:"
-	@ls -ld $(GOBIN)/geth-linux-* | grep mips64
-
-geth-linux-mips64le:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=linux/mips64le -v ./cmd/geth
-	@echo "Linux MIPS64le cross compilation done:"
-	@ls -ld $(GOBIN)/geth-linux-* | grep mips64le
-
-geth-darwin: geth-darwin-386 geth-darwin-amd64
-	@echo "Darwin cross compilation done:"
-	@ls -ld $(GOBIN)/geth-darwin-*
-
-geth-darwin-386:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=darwin/386 -v ./cmd/geth
-	@echo "Darwin 386 cross compilation done:"
-	@ls -ld $(GOBIN)/geth-darwin-* | grep 386
-
-geth-darwin-amd64:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=darwin/amd64 -v ./cmd/geth
-	@echo "Darwin amd64 cross compilation done:"
-	@ls -ld $(GOBIN)/geth-darwin-* | grep amd64
-
-geth-windows: geth-windows-386 geth-windows-amd64
-	@echo "Windows cross compilation done:"
-	@ls -ld $(GOBIN)/geth-windows-*
-
-geth-windows-386:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=windows/386 -v ./cmd/geth
-	@echo "Windows 386 cross compilation done:"
-	@ls -ld $(GOBIN)/geth-windows-* | grep 386
-
-geth-windows-amd64:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=windows/amd64 -v ./cmd/geth
-	@echo "Windows amd64 cross compilation done:"
-	@ls -ld $(GOBIN)/geth-windows-* | grep amd64
-
-geth-android:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=android-21/aar -v ./cmd/geth
-	@echo "Android cross compilation done:"
-	@ls -ld $(GOBIN)/geth-android-*
-
-geth-ios:
-	build/env.sh go run build/ci.go xgo -- --go=$(GO) --dest=$(GOBIN) --targets=ios-7.0/framework -v ./cmd/geth
-	@echo "iOS framework cross compilation done:"
-	@ls -ld $(GOBIN)/geth-ios-*
+#? help: Get more info on make commands.
+help: Makefile
+	@echo ''
+	@echo 'Usage:'
+	@echo '  make [target]'
+	@echo ''
+	@echo 'Targets:'
+	@sed -n 's/^#?//p' $< | column -t -s ':' |  sort | sed -e 's/^/ /'

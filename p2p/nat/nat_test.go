@@ -17,10 +17,12 @@
 package nat
 
 import (
-	"bytes"
 	"net"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 // This test checks that autodisc doesn't hang and returns
@@ -29,7 +31,7 @@ import (
 func TestAutoDiscRace(t *testing.T) {
 	ad := startautodisc("thing", func() Interface {
 		time.Sleep(500 * time.Millisecond)
-		return extIP{33, 44, 55, 66}
+		return ExtIP{33, 44, 55, 66}
 	})
 
 	// Spawn a few concurrent calls to ad.ExternalIP.
@@ -56,9 +58,30 @@ func TestAutoDiscRace(t *testing.T) {
 				t.Errorf("result %d: unexpected error: %v", i, rval.err)
 			}
 			wantIP := net.IP{33, 44, 55, 66}
-			if !bytes.Equal(rval.ip, wantIP) {
+			if !rval.ip.Equal(wantIP) {
 				t.Errorf("result %d: got IP %v, want %v", i, rval.ip, wantIP)
 			}
 		}
+	}
+}
+
+// stun should work well
+func TestParseStun(t *testing.T) {
+	testcases := []struct {
+		natStr string
+		want   *stun
+	}{
+		{"stun", &stun{serverList: strings.Split(stunDefaultServers, "\n")}},
+		{"stun:1.2.3.4:1234", &stun{serverList: []string{"1.2.3.4:1234"}}},
+		{"stun:[2001:db8::1]:3478", &stun{serverList: []string{"[2001:db8::1]:3478"}}},
+	}
+
+	for _, tc := range testcases {
+		nat, err := Parse(tc.natStr)
+		if err != nil {
+			t.Errorf("should no err, but get %v", err)
+		}
+		stun := nat.(*stun)
+		assert.Equal(t, stun.serverList, tc.want.serverList)
 	}
 }

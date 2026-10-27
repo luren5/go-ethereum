@@ -14,8 +14,6 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-//+build go1.5
-
 package debug
 
 import (
@@ -23,8 +21,7 @@ import (
 	"os"
 	"runtime/trace"
 
-	"github.com/ethereum/go-ethereum/logger"
-	"github.com/ethereum/go-ethereum/logger/glog"
+	"github.com/ethereum/go-ethereum/log"
 )
 
 // StartGoTrace turns on tracing, writing to the given file.
@@ -44,11 +41,11 @@ func (h *HandlerT) StartGoTrace(file string) error {
 	}
 	h.traceW = f
 	h.traceFile = file
-	glog.V(logger.Info).Infoln("trace started, writing to", h.traceFile)
+	log.Info("Go tracing started", "dump", h.traceFile)
 	return nil
 }
 
-// StopTrace stops an ongoing trace.
+// StopGoTrace stops an ongoing trace.
 func (h *HandlerT) StopGoTrace() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -56,7 +53,7 @@ func (h *HandlerT) StopGoTrace() error {
 	if h.traceW == nil {
 		return errors.New("trace not in progress")
 	}
-	glog.V(logger.Info).Infoln("done writing trace to", h.traceFile)
+	log.Info("Done writing Go trace", "dump", h.traceFile)
 	h.traceW.Close()
 	h.traceW = nil
 	h.traceFile = ""
